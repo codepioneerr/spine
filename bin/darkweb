@@ -194,8 +194,33 @@ def db_status():
     return "OK", f"{size:,.1f} MB", P.GREEN
 
 
+def lock_status():
+    """Is a job running right now?
+
+    Read the pid out of the lock file and check it is alive. Deliberately
+    does NOT try to flock() the file: acquiring it, even for a microsecond,
+    could make a real job skip — and jobs skip rather than queue.
+    """
+    lock = os.environ.get("SPINE_LOCK", "/tmp/spine.lock")
+    if not os.path.exists(lock):
+        return "FREE", "global serialization - CLAUDE.md section 2", P.GREEN
+    try:
+        with open(lock) as fh:
+            pid = int((fh.read().strip() or "0"))
+    except Exception:
+        pid = 0
+    if pid <= 0:
+        return "FREE", "global serialization - CLAUDE.md section 2", P.GREEN
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return "FREE", f"stale lock file, pid {pid} gone", P.GREEN
+    return "HELD", f"a job is running (pid {pid})", P.AMBER
+
+
 def load_jobs():
-    """Phase 0 replaces this with core.registry. Until then, say so — a
+    """Live rows from core.registry (Phase 0). If the registry cannot be
+    imported the panel says so rather than showing an empty table — a
     console that invents numbers is worse than one that admits a gap."""
     try:
         sys.path.insert(0, spine_root())
@@ -262,13 +287,12 @@ def header():
 
 def section(title, note=""):
     label = f"┤ {title} ├"
-    tail = INNER - len(label) - 3
+    note = f" {note} " if note else ""
+    dashes = INNER - 2 - len(label) - len(note)
     r = Row().add("──", P.GREEN_F).add(label, P.GREEN)
     if note:
-        note = f" {note} "
         r.add(note, P.GREEN_F)
-        tail -= len(note) + 1
-    r.add("─" * max(0, tail + 1), P.GREEN_F)
+    r.add("─" * max(0, dashes), P.GREEN_F)
     return r
 
 
@@ -332,33 +356,48 @@ def panel_integrity():
                     .add(f"  {label:<9}", P.GREEN_D)
                     .add(f"{state:<9}", color)
                     .add(detail, P.GREEN_F))
-    lock = "/tmp/spine.lock"
-    held = os.path.exists(lock)
+    state, detail, color = lock_status()
     rows.append(Row()
                 .add(f"  {'flock':<9}", P.GREEN_D)
-                .add(f"{'HELD' if held else 'FREE':<9}",
-                     P.AMBER if held else P.GREEN)
-                .add("global serialization — CLAUDE.md section 2", P.GREEN_F))
+                .add(f"{state:<9}", color)
+                .add(detail, P.GREEN_F))
     return rows
 
 
 def panel_jobs():
     jobs, gap = load_jobs()
-    rows = [section("SCHEDULE", f"{len(jobs)} jobs" if not gap else "")]
+    live = [j for j in jobs if j.get("enabled", True)]
+    rows = [section("SCHEDULE",
+                    "" if gap else f"{len(live)} live / {len(jobs)}")]
     if gap:
-        rows.append(Row().add("  ── ", P.GREEN_F)
+        rows.append(Row().add("  -- ", P.GREEN_F)
                     .add(gap, P.GREEN_D)
-                    .add("  ── nothing scheduled yet", P.GREEN_F))
+                    .add("  -- nothing scheduled yet", P.GREEN_F))
         return rows
-    rows.append(Row().add("  JOB           SCHEDULE      WIN    WGT     LAST",
-                          P.GREEN_F))
+    if not jobs:
+        rows.append(Row().add("  no collectors registered yet", P.GREEN_D))
+        return rows
+
+    rows.append(Row().add(
+        "  JOB          SCHEDULE      WIN   WGT    RAM   LAST RUN", P.GREEN_F))
+
+    outcome_color = {"ok": P.GREEN, "skipped": P.GREEN_D, "dry-run": P.CYAN,
+                     "failed": P.RED, "timeout": P.RED}
+
     for j in jobs:
+        last = str(j.get("last", "-"))
+        if last != "-" and last.endswith("Z") and "T" in last:
+            last = last[5:16].replace("T", " ")  # MM-DD HH:MM
+        oc = str(j.get("outcome", "-"))
         rows.append(Row()
-                    .add(f"  {j['id']:<13} ", P.WHITE)
+                    .add(f"  {j['id']:<12} ", P.WHITE if j.get("enabled", True)
+                         else P.GREEN_F)
                     .add(f"{j['schedule']:<13} ", P.GREEN_D)
-                    .add(f"{j.get('window','any'):<6} ", P.GREEN_D)
-                    .add(f"{j.get('weight','light'):<7} ", P.GREEN_D)
-                    .add(str(j.get("last", "—")), P.CYAN))
+                    .add(f"{j.get('window','any'):<5} ", P.GREEN_D)
+                    .add(f"{j.get('weight','light'):<6} ", P.GREEN_D)
+                    .add(f"{j.get('ram_mb', 0):>4}M  ", P.GREEN_D)
+                    .add(f"{last:<12}", P.CYAN)
+                    .add(oc, outcome_color.get(oc, P.GREEN_F)))
     return rows
 
 

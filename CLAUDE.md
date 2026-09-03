@@ -173,8 +173,8 @@ that stops silo #11.
 | Phase | What | Status |
 |---|---|---|
 | **Step 1** | Repo, rules, `bin/darkweb` cyber surface | ✅ this commit |
-| **0** | Job contract · registry generates crontab · `run.sh` + flock · windows + RAM guard | awaiting approval |
-| **1** | Model router (tiers, not model names) · cost accounting · `bin/status` · secrets | |
+| **0** | Job contract · registry generates crontab · `run.sh` + flock · windows + RAM guard | ✅ complete |
+| **1** | Model router (tiers, not model names) · cost accounting · `bin/status` · secrets | awaiting approval |
 | **2** | Item store · reimplement the 3 collectors · retire darkweb-jobs | |
 | **3** | **Proptech collector** (ACRIS/PLUTO depth) | *order changed by Nick, Sept 3* |
 | **4** | Assistant v1 — daily brief → Telegram | |

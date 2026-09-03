@@ -99,8 +99,8 @@ function for clean secrets handling rather than a claim that it's finished.
 | Phase | | |
 |---|---|---|
 | Step 1 | repo, rules, console surface | ✅ |
-| 0 | job contract · crontab registry · runner · RAM guard | in progress |
-| 1 | model router · cost accounting · `bin/status` | |
+| 0 | job contract · crontab registry · runner · RAM guard | ✅ |
+| 1 | model router · cost accounting · `bin/status` | next |
 | 2 | the item store | |
 | 3 | proptech collector | |
 | 4 | assistant v1 — daily brief | |
@@ -112,8 +112,12 @@ function for clean secrets handling rather than a claim that it's finished.
 ```bash
 git clone <this repo> && cd spine
 cp .env.example .env && chmod 600 .env
-bin/darkweb            # the console
-bin/darkweb --watch    # live
+bin/darkweb                          # the console
+bin/darkweb --watch                  # live
+python3 -m core.registry --list      # what is registered
+python3 -m core.registry --diff      # what installing would change
+python3 -m core.registry --install   # write the crontab (asks first)
+bin/run.sh heartbeat --dry-run       # exercise the gates
 python3 -m unittest discover -s tests
 ```
 

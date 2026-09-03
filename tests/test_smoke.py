@@ -85,8 +85,10 @@ class TestConsole(unittest.TestCase):
     def test_reports_gaps_instead_of_inventing_numbers(self):
         self.dw.P.off()
         out = self.dw.render()
-        self.assertIn("Phase 0", out)   # registry not built yet
         self.assertIn("Phase 1", out)   # cost accounting not built yet
+        self.assertIn("Phase 2", out)   # item store not built yet
+        # and the panels that ARE built show real rows, not placeholders
+        self.assertIn("heartbeat", out)
 
     def test_runs_as_a_subprocess(self):
         r = subprocess.run([sys.executable, DARKWEB, "--no-color"],
