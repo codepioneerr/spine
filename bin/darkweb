@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+darkweb — the Spine / NickOS console.
+
+Layer 5 surface. Phosphor-green CRT readout of the box: memory, load, disk,
+secrets hygiene, scheduled jobs, and month-to-date API spend.
+
+Stdlib only. No pip install, ever. (CLAUDE.md section 5 — zero bloat.)
+
+    bin/darkweb                 one-shot render
+    bin/darkweb --watch         refresh every 2s until Ctrl-C
+    bin/darkweb --watch 10      refresh every 10s
+    bin/darkweb --no-color      plain text, for piping and for logs
+    bin/darkweb --scanlines     CRT scanline effect, purely decorative
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import socket
+import sys
+import time
+from datetime import datetime, timezone
+
+VERSION = "0.1.0"
+INNER = 70  # printable columns inside the bezel
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# palette
+# ─────────────────────────────────────────────────────────────────────────────
+
+class P:
+    """Phosphor palette. Truecolor with a 16-color fallback baked into the
+    escape sequence order, so a dumb terminal still gets green-on-black."""
+
+    enabled = True
+
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+
+    GREEN = "\033[38;2;0;255;0m"      # #00FF00 — phosphor
+    GREEN_D = "\033[38;2;0;140;0m"    # dim trace
+    GREEN_F = "\033[38;2;0;80;0m"     # faded, bezel and rules
+    AMBER = "\033[38;2;255;176;0m"    # warning
+    RED = "\033[38;2;255;56;56m"      # critical
+    CYAN = "\033[38;2;0;220;200m"     # values / accents
+    WHITE = "\033[38;2;220;255;220m"
+
+    @classmethod
+    def off(cls):
+        cls.enabled = False
+        for name in ("RESET", "BOLD", "DIM", "GREEN", "GREEN_D", "GREEN_F",
+                     "AMBER", "RED", "CYAN", "WHITE"):
+            setattr(cls, name, "")
+
+
+def supports_color(stream) -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    return hasattr(stream, "isatty") and stream.isatty()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# row builder — tracks visible width so colored text still pads correctly
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Row:
+    __slots__ = ("parts", "w")
+
+    def __init__(self):
+        self.parts = []
+        self.w = 0
+
+    def add(self, text, color=""):
+        text = str(text)
+        self.parts.append((color, text))
+        self.w += len(text)
+        return self
+
+    def render(self, width=INNER):
+        """Pad to `width`, and CLIP to it. Clipping matters: a row that
+        overruns pushes the bezel out and the whole frame goes ragged."""
+        out, used = [], 0
+        for color, text in self.parts:
+            if used >= width:
+                break
+            if used + len(text) > width:
+                text = text[:width - used]
+            used += len(text)
+            out.append(f"{color}{text}{P.RESET}" if color else text)
+        return "".join(out) + " " * max(0, width - used)
+
+
+def rule(char="─", color=None):
+    return Row().add(char * INNER, color or P.GREEN_F)
+
+
+def blank():
+    return Row()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# readings — real where cheap, honestly absent where not yet built
+# ─────────────────────────────────────────────────────────────────────────────
+
+def read_meminfo():
+    """(total_mb, available_mb, used_pct) or None off Linux."""
+    try:
+        vals = {}
+        with open("/proc/meminfo", "r") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                vals[key] = int(rest.strip().split()[0])  # kB
+        total = vals["MemTotal"] / 1024
+        avail = vals.get("MemAvailable", vals.get("MemFree", 0)) / 1024
+        return total, avail, (total - avail) / total * 100 if total else 0.0
+    except Exception:
+        return None
+
+
+def read_swap():
+    try:
+        vals = {}
+        with open("/proc/meminfo", "r") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                vals[key] = int(rest.strip().split()[0])
+        total = vals.get("SwapTotal", 0) / 1024
+        free = vals.get("SwapFree", 0) / 1024
+        return total, total - free
+    except Exception:
+        return None
+
+
+def read_loadavg():
+    try:
+        return os.getloadavg()
+    except Exception:
+        return None
+
+
+def read_uptime():
+    try:
+        with open("/proc/uptime", "r") as fh:
+            secs = float(fh.read().split()[0])
+        d, rem = divmod(int(secs), 86400)
+        h, rem = divmod(rem, 3600)
+        m = rem // 60
+        return f"{d}d {h:02d}h {m:02d}m" if d else f"{h:02d}h {m:02d}m"
+    except Exception:
+        return None
+
+
+def read_disk(path="/"):
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize / 2**30
+        free = st.f_bavail * st.f_frsize / 2**30
+        return total, free, (total - free) / total * 100 if total else 0.0
+    except Exception:
+        return None
+
+
+def spine_root():
+    return os.environ.get("SPINE_ROOT") or os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+
+
+def env_status():
+    """Secrets hygiene is a first-class readout, not an afterthought."""
+    path = os.path.join(spine_root(), ".env")
+    if not os.path.exists(path):
+        return "ABSENT", "not created yet", P.AMBER
+    mode = os.stat(path).st_mode & 0o777
+    if mode != 0o600:
+        return "INSECURE", f"mode {mode:o}, expected 600", P.RED
+    return "OK", "mode 600", P.GREEN
+
+
+def db_status():
+    path = os.environ.get("SPINE_DB") or os.path.join(
+        spine_root(), "var", "spine.db")
+    if not os.path.exists(path):
+        return "ABSENT", "item store lands in Phase 2", P.GREEN_D
+    size = os.path.getsize(path) / 2**20
+    return "OK", f"{size:,.1f} MB", P.GREEN
+
+
+def load_jobs():
+    """Phase 0 replaces this with core.registry. Until then, say so — a
+    console that invents numbers is worse than one that admits a gap."""
+    try:
+        sys.path.insert(0, spine_root())
+        from core.registry import all_jobs  # type: ignore
+        return list(all_jobs()), None
+    except Exception:
+        return [], "registry lands in Phase 0"
+
+
+def load_spend():
+    """Phase 1 replaces this with a query against the costs table."""
+    try:
+        sys.path.insert(0, spine_root())
+        from core.costs import month_to_date  # type: ignore
+        return month_to_date(), None
+    except Exception:
+        return None, "cost accounting lands in Phase 1"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# widgets
+# ─────────────────────────────────────────────────────────────────────────────
+
+def grade(pct, warn=70.0, crit=88.0):
+    return P.RED if pct >= crit else P.AMBER if pct >= warn else P.GREEN
+
+
+def bar(pct, width=24, warn=70.0, crit=88.0):
+    pct = max(0.0, min(100.0, float(pct)))
+    filled = int(round(pct / 100.0 * width))
+    return grade(pct, warn, crit), "█" * filled + "░" * (width - filled)
+
+
+def metric(label, pct, detail, width=24, warn=70.0, crit=88.0):
+    color, glyph = bar(pct, width, warn, crit)
+    return (Row()
+            .add(f"  {label:<8}", P.GREEN_D)
+            .add(glyph, color)
+            .add(f" {pct:5.1f}%  ", color)
+            .add(detail, P.GREEN_D))
+
+
+BANNER = [
+    r" ███████╗██████╗ ██╗███╗   ██╗███████╗",
+    r" ██╔════╝██╔══██╗██║████╗  ██║██╔════╝",
+    r" ███████╗██████╔╝██║██╔██╗ ██║█████╗  ",
+    r" ╚════██║██╔═══╝ ██║██║╚██╗██║██╔══╝  ",
+    r" ███████║██║     ██║██║ ╚████║███████╗",
+    r" ╚══════╝╚═╝     ╚═╝╚═╝  ╚═══╝╚══════╝",
+]
+
+
+def header():
+    rows = []
+    for i, line in enumerate(BANNER):
+        r = Row().add(line, P.GREEN if i < 3 else P.GREEN_D)
+        if i == 2:
+            r.add("   NickOS", P.CYAN)
+        if i == 3:
+            r.add(f"   personal OS  v{VERSION}", P.GREEN_F)
+        rows.append(r)
+    return rows
+
+
+def section(title, note=""):
+    label = f"┤ {title} ├"
+    tail = INNER - len(label) - 3
+    r = Row().add("──", P.GREEN_F).add(label, P.GREEN)
+    if note:
+        note = f" {note} "
+        r.add(note, P.GREEN_F)
+        tail -= len(note) + 1
+    r.add("─" * max(0, tail + 1), P.GREEN_F)
+    return r
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# panels
+# ─────────────────────────────────────────────────────────────────────────────
+
+def panel_system():
+    rows = [section("SYSTEM")]
+
+    mem = read_meminfo()
+    if mem:
+        total, avail, pct = mem
+        rows.append(metric("MEM", pct,
+                           f"{avail/1024:.1f} GiB free of {total/1024:.1f}"))
+        if total / 1024 < 9:  # the 8 GB ceiling this whole design is built on
+            head = int(os.environ.get("SPINE_RAM_HEADROOM_MB", 1024))
+            ok = avail >= head + 200
+            rows.append(Row()
+                        .add("           night-window heavy job: ", P.GREEN_F)
+                        .add("CLEAR" if ok else "BLOCKED",
+                             P.GREEN if ok else P.AMBER)
+                        .add(f"  (needs {head} MB headroom)", P.GREEN_F))
+    else:
+        rows.append(Row().add("  MEM      ", P.GREEN_D)
+                    .add("unavailable — /proc not present (not Linux)", P.AMBER))
+
+    swap = read_swap()
+    if swap and swap[0] > 0:
+        stotal, sused = swap
+        spct = sused / stotal * 100
+        rows.append(metric("SWAP", spct, f"{sused:.0f} MB of {stotal:.0f} MB",
+                           warn=1.0, crit=20.0))
+
+    disk = read_disk(spine_root())
+    if disk:
+        total, free, pct = disk
+        rows.append(metric("DISK", pct, f"{free:.0f} GiB free of {total:.0f}"))
+
+    la = read_loadavg()
+    if la:
+        cores = os.cpu_count() or 1
+        pct = min(100.0, la[0] / cores * 100)
+        rows.append(metric("LOAD", pct,
+                           f"{la[0]:.2f} {la[1]:.2f} {la[2]:.2f} · {cores} cpu"))
+
+    up = read_uptime()
+    if up:
+        rows.append(Row().add("  UPTIME   ", P.GREEN_D).add(up, P.CYAN))
+
+    return rows
+
+
+def panel_integrity():
+    rows = [section("INTEGRITY")]
+    for label, (state, detail, color) in (
+        ("secrets", env_status()),
+        ("itemdb", db_status()),
+    ):
+        rows.append(Row()
+                    .add(f"  {label:<9}", P.GREEN_D)
+                    .add(f"{state:<9}", color)
+                    .add(detail, P.GREEN_F))
+    lock = "/tmp/spine.lock"
+    held = os.path.exists(lock)
+    rows.append(Row()
+                .add(f"  {'flock':<9}", P.GREEN_D)
+                .add(f"{'HELD' if held else 'FREE':<9}",
+                     P.AMBER if held else P.GREEN)
+                .add("global serialization — CLAUDE.md section 2", P.GREEN_F))
+    return rows
+
+
+def panel_jobs():
+    jobs, gap = load_jobs()
+    rows = [section("SCHEDULE", f"{len(jobs)} jobs" if not gap else "")]
+    if gap:
+        rows.append(Row().add("  ── ", P.GREEN_F)
+                    .add(gap, P.GREEN_D)
+                    .add("  ── nothing scheduled yet", P.GREEN_F))
+        return rows
+    rows.append(Row().add("  JOB           SCHEDULE      WIN    WGT     LAST",
+                          P.GREEN_F))
+    for j in jobs:
+        rows.append(Row()
+                    .add(f"  {j['id']:<13} ", P.WHITE)
+                    .add(f"{j['schedule']:<13} ", P.GREEN_D)
+                    .add(f"{j.get('window','any'):<6} ", P.GREEN_D)
+                    .add(f"{j.get('weight','light'):<7} ", P.GREEN_D)
+                    .add(str(j.get("last", "—")), P.CYAN))
+    return rows
+
+
+def panel_spend():
+    spend, gap = load_spend()
+    rows = [section("SPEND")]
+    if gap:
+        rows.append(Row().add("  ── ", P.GREEN_F)
+                    .add(gap, P.GREEN_D)
+                    .add("  ── no model calls made", P.GREEN_F))
+        return rows
+    cap = float(os.environ.get("SPINE_MONTHLY_USD_CAP", "5.00"))
+    pct = spend / cap * 100 if cap else 0.0
+    rows.append(metric("MTD", pct, f"${spend:.2f} of ${cap:.2f} cap",
+                       warn=60.0, crit=85.0))
+    return rows
+
+
+def panel_footer():
+    host = socket.gethostname()
+    now = datetime.now().astimezone()
+    utc = datetime.now(timezone.utc)
+    return [
+        rule(),
+        (Row()
+         .add("  host ", P.GREEN_F).add(f"{host:<12}", P.CYAN)
+         .add(" local ", P.GREEN_F).add(now.strftime("%Y-%m-%d %H:%M:%S %Z"), P.CYAN)
+         .add("  utc ", P.GREEN_F).add(utc.strftime("%H:%M"), P.GREEN_D)),
+        (Row()
+         .add("  read-only assistant · draft-only email · nothing sends "
+              "without you", P.GREEN_F)),
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRT bezel
+# ─────────────────────────────────────────────────────────────────────────────
+
+def frame(rows, scanlines=False):
+    """Wrap the panels in a CRT bezel.
+
+    Every emitted line is exactly MARGIN + BEZEL visible columns wide. The
+    widths below are derived from INNER rather than hand-counted, because
+    hand-counted box drawing is how you get a frame that is ragged on one
+    row out of forty and nobody notices for a month.
+    """
+    B = P.GREEN_F
+    MARGIN = "  "
+    BEZEL = INNER + 8          # ║ │ <body> │ ║  -> 4 + INNER + 4
+    SCREEN = INNER + 2         # ┌<...>┐ interior
+
+    out = [f"{B}{MARGIN}╔{'═' * (BEZEL - 2)}╗{P.RESET}",
+           f"{B}{MARGIN}║ ┌{'─' * SCREEN}┐ ║{P.RESET}"]
+
+    for i, row in enumerate(rows):
+        body = row.render(INNER)
+        if scanlines and i % 2 == 1 and P.enabled:
+            body = P.DIM + body + P.RESET
+        out.append(f"{B}{MARGIN}║ │{P.RESET} {body} {B}│ ║{P.RESET}")
+
+    out.append(f"{B}{MARGIN}║ └{'─' * SCREEN}┘ ║{P.RESET}")
+
+    # power strip: ● PWR  ▄▄▄  D A R K W E B  ▄▄▄
+    label = "  D A R K W E B  "
+    lead = "  ● PWR  "
+    tail = "  "
+    fill = BEZEL - 2 - len(lead) - len(label) - len(tail)
+    left = fill // 2
+    right = fill - left
+    out.append(
+        f"{B}{MARGIN}║{P.RESET}  {P.GREEN}●{P.RESET}{P.GREEN_F} PWR  "
+        f"{'▄' * left}{P.RESET}{P.GREEN_D}{label}{P.RESET}"
+        f"{P.GREEN_F}{'▄' * right}{tail}{P.RESET}{B}║{P.RESET}")
+
+    out.append(f"{B}{MARGIN}╚{'═' * (BEZEL - 2)}╝{P.RESET}")
+    return out
+
+
+def compose():
+    rows = []
+    rows += header()
+    rows.append(blank())
+    rows += panel_system()
+    rows.append(blank())
+    rows += panel_integrity()
+    rows.append(blank())
+    rows += panel_jobs()
+    rows.append(blank())
+    rows += panel_spend()
+    rows += panel_footer()
+    return rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render(scanlines=False):
+    return "\n".join(frame(compose(), scanlines))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="darkweb",
+        description="Spine / NickOS console.")
+    ap.add_argument("--watch", nargs="?", const=2.0, type=float, default=None,
+                    metavar="SECONDS",
+                    help="refresh continuously (default every 2s)")
+    ap.add_argument("--no-color", action="store_true",
+                    help="disable ANSI color")
+    ap.add_argument("--scanlines", action="store_true",
+                    help="CRT scanline effect")
+    ap.add_argument("--version", action="version", version=f"darkweb {VERSION}")
+    args = ap.parse_args(argv)
+
+    if args.no_color or not supports_color(sys.stdout):
+        P.off()
+
+    cols = shutil.get_terminal_size((80, 24)).columns
+    if cols < INNER + 8 and sys.stdout.isatty():
+        sys.stderr.write(
+            f"darkweb: terminal is {cols} cols; needs {INNER + 8}. "
+            "Widen the window.\n")
+
+    if args.watch is None:
+        print(render(args.scanlines))
+        return 0
+
+    try:
+        sys.stdout.write("\033[?25l")  # hide cursor
+        while True:
+            sys.stdout.write("\033[H\033[2J")
+            sys.stdout.write(render(args.scanlines) + "\n")
+            sys.stdout.flush()
+            time.sleep(max(0.5, args.watch))
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        sys.stdout.write("\033[?25h\033[0m\n")  # show cursor, reset
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
