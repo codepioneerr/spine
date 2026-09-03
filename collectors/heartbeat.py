@@ -8,6 +8,10 @@ recent green `heartbeat`, every part of Phase 0 is working.
 It is also the shortest possible example of the contract, and the thing to
 copy when writing a real collector.
 
+**Permanent.** Nick's ruling, Sept 3 2026: 30 MB every 30 minutes is a
+negligible price for knowing at a glance that the box is breathing. It stays
+in the schedule for the life of the framework.
+
 Deliberately: no network, no model call, no writes outside var/. It costs
 nothing to leave running forever.
 """
@@ -18,7 +22,12 @@ import time
 
 META = {
     "id": "heartbeat",
-    "schedule": "*/30 * * * *",   # UTC, every 30 minutes
+    # Fires :07 and :37 UTC, NOT :00/:30. darkweb-jobs runs its polymarket
+    # snapshot on */30, and until that system is retired (Phase 2) its lock
+    # and ours are separate domains — so we stay out of its way by clock
+    # rather than by lock. Note the form: "7/30" is the ambiguous spelling
+    # core.cron deliberately rejects; "7-59/30" is the honest one.
+    "schedule": "7-59/30 * * * *",
     "timeout": 30,
     "ram_mb": 30,
     "window": "any",

@@ -373,3 +373,49 @@ class TestRunShell(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRunShellEnvIsolation(unittest.TestCase):
+    """Regression: the first Phase 0 bundle shipped a .env containing
+    SPINE_ROOT=/opt/spine. `set -a; . .env` overwrote the root that run.sh
+    had correctly derived from its own path, and every job died on
+    `cd: /opt/spine: No such file or directory`.
+
+    The tests passed because no .env existed in the test tree. Found on the
+    Dell, by running it.
+    """
+
+    def test_env_cannot_relocate_the_checkout(self):
+        import shutil
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "spine")
+            shutil.copytree(ROOT, repo, ignore=shutil.ignore_patterns(
+                ".git", "var", "__pycache__", "*.pyc"))
+            env_path = os.path.join(repo, ".env")
+            with open(env_path, "w") as fh:
+                fh.write("SPINE_ROOT=/nonexistent/opt/spine\n"
+                         "SPINE_DB=/nonexistent/opt/spine/var/spine.db\n")
+            os.chmod(env_path, 0o600)
+
+            r = subprocess.run(
+                ["bash", os.path.join(repo, "bin", "run.sh"),
+                 "heartbeat", "--dry-run"],
+                capture_output=True, text=True, timeout=60,
+                env={**os.environ, "SPINE_LOCK": os.path.join(d, "lock")})
+
+            self.assertNotIn("No such file or directory", r.stdout + r.stderr)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("dry-run", (r.stdout + r.stderr).lower())
+
+    def test_env_example_ships_no_absolute_install_path(self):
+        """A path in .env.example is wrong for everyone who is not the
+        author. SPINE_ROOT must not be set there at all."""
+        with open(os.path.join(ROOT, ".env.example")) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                key = line.split("=")[0]
+                self.assertNotEqual(key, "SPINE_ROOT",
+                                    "SPINE_ROOT must not be set in .env.example")

@@ -28,7 +28,12 @@ if [ -z "$JOB" ]; then
 fi
 shift
 
-SPINE_ROOT="${SPINE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# The repo knows where it is. This is computed from the script's own path and
+# is RE-ASSERTED after .env is sourced, because `set -a; . .env` would
+# otherwise let a stale SPINE_ROOT in .env point the runner at a directory
+# that does not exist. That exact bug shipped in the first Phase 0 bundle.
+SPINE_ROOT_REAL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SPINE_ROOT="$SPINE_ROOT_REAL"
 export SPINE_ROOT
 
 LOCK="${SPINE_LOCK:-/tmp/spine.lock}"
@@ -51,6 +56,10 @@ if [ -f "$SPINE_ROOT/.env" ]; then
   . "$SPINE_ROOT/.env"
   set +a
 fi
+
+# .env may not relocate the checkout. Anything else in it is free to win.
+SPINE_ROOT="$SPINE_ROOT_REAL"
+export SPINE_ROOT
 
 PYTHON="${SPINE_PYTHON:-python3}"
 
