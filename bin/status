@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#
+# bin/status — the plain-text readout. Same data as bin/darkweb, no ANSI.
+#
+# A thin wrapper on purpose: two entry points that fetch their own data
+# inevitably disagree about something, and the disagreement is always found
+# at the worst possible moment. One code path, two presentations.
+#
+#   bin/status            everything, greppable
+#   bin/status | mail me  cron-friendly
+#
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/darkweb" --plain "$@"

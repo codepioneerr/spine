@@ -75,7 +75,8 @@ Jobs declare what they cost and when they may run:
 ```python
 META = {
     "id": "acris", "schedule": "0 6 * * *", "timeout": 900,
-    "ram_mb": 150, "window": "night", "weight": "light", "tier": None,
+    "ram_mb": 150, "window": "night", "weight": "light",
+    "tier": None, "data": "private",
 }
 ```
 
@@ -83,6 +84,17 @@ Heavy jobs run only in the night window. A pre-flight RAM guard skips a job
 rather than letting the box swap. Daytime is reserved for light work so the
 interactive path stays responsive. A skipped run is recoverable; an
 OOM-killed box at 3am is not.
+
+## Privacy is enforced, not documented
+
+Every provider declares whether it retains prompts. Every job declares
+whether its data is private — and **private is the default**. A job handling
+your own data cannot be routed to a logging endpoint; the call raises rather
+than quietly downgrading. Opting *out* is the deliberate act, because the
+mistake worth designing against is forgetting.
+
+The spend cap works the same way: month-to-date plus a pessimistic estimate
+is checked *before* the request is sent, not reported after the bill arrives.
 
 ## Safety posture
 
@@ -100,8 +112,8 @@ function for clean secrets handling rather than a claim that it's finished.
 |---|---|---|
 | Step 1 | repo, rules, console surface | ✅ |
 | 0 | job contract · crontab registry · runner · RAM guard | ✅ |
-| 1 | model router · cost accounting · `bin/status` | next |
-| 2 | the item store | |
+| 1 | model router · cost accounting · `bin/status` | ✅ |
+| 2 | the item store | next |
 | 3 | proptech collector | |
 | 4 | assistant v1 — daily brief | |
 | 5 | email + calendar, read-only | |
@@ -114,6 +126,8 @@ git clone <this repo> && cd spine
 cp .env.example .env && chmod 600 .env
 bin/darkweb                          # the console
 bin/darkweb --watch                  # live
+bin/status                           # same data, plain text, greppable
+python3 -m core.costs --month        # spend by job and tier
 python3 -m core.registry --list      # what is registered
 python3 -m core.registry --diff      # what installing would change
 python3 -m core.registry --install   # write the crontab (asks first)

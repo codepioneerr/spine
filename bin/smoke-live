@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+#
+# bin/smoke-live — Step 10. ONE real API call, run by hand.
+#
+# Everything in tests/ runs offline against MockProvider. This is the only
+# thing that opens a socket, and it is deliberately not part of the suite:
+# a test that spends tokens is a test people stop running.
+#
+# Proves three things the mock cannot: the socket works, the provider's
+# response shape is what the adapter expects, and the token counts it
+# reports land in the costs table as real dollars.
+#
+#   bin/smoke-live            uses GEMINI_API_KEY from .env
+#
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 70
+
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+
+if [ -z "${GEMINI_API_KEY:-}" ]; then
+  echo "GEMINI_API_KEY is not set in .env — nothing to test against." >&2
+  echo "Hermes already holds a Google AI Studio key on this box; copy it in." >&2
+  exit 78
+fi
+
+echo ">> one live call to the bulk tier, declared PUBLIC data"
+python3 - <<'PY'
+import sys; sys.path.insert(0, ".")
+from core import costs, models
+
+before = costs.month_to_date()
+r = models.Router(tiers=models.default_tiers(), job="smoke_live",
+                  data="public", log=print)
+out = r.complete("Reply with exactly the word: alive", tier="bulk",
+                 max_tokens=16)
+
+print()
+print(f"  provider : {out.provider} ({out.model})")
+print(f"  reply    : {out.text.strip()[:80]!r}")
+print(f"  tokens   : {out.tokens_in} in, {out.tokens_out} out")
+print(f"  cost     : ${out.usd:.8f}   latency {out.latency_ms} ms")
+print(f"  mtd      : ${before:.6f} -> ${costs.month_to_date():.6f}")
+print()
+print("  a PRIVATE job on this same tier would have been refused:")
+try:
+    models.Router(tiers=models.default_tiers(), job="smoke_live",
+                  data="private").complete("x", tier="bulk")
+    print("  !! NOT REFUSED — the privacy gate is broken, stop and report")
+    sys.exit(1)
+except models.PrivacyRefusal:
+    print("  refused, as designed.")
+PY

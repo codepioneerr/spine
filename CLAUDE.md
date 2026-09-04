@@ -80,6 +80,7 @@ META = {
     "window":   "night",       # night | day | any
     "weight":   "light",       # light (<200 MB) | heavy (browser, model, big batch)
     "tier":     None,          # None | "bulk" | "smart" | "frontier"
+    "data":     "private",     # public | private  — DEFAULTS TO PRIVATE
 }
 ```
 
@@ -174,8 +175,8 @@ that stops silo #11.
 |---|---|---|
 | **Step 1** | Repo, rules, `bin/darkweb` cyber surface | ✅ this commit |
 | **0** | Job contract · registry generates crontab · `run.sh` + flock · windows + RAM guard | ✅ complete |
-| **1** | Model router (tiers, not model names) · cost accounting · `bin/status` · secrets | awaiting approval |
-| **2** | Item store · reimplement the 3 collectors · retire darkweb-jobs | |
+| **1** | Model router (tiers, not model names) · cost accounting · `bin/status` | ✅ complete |
+| **2** | Item store · reimplement the 3 collectors · retire darkweb-jobs | awaiting approval |
 | **3** | **Proptech collector** (ACRIS/PLUTO depth) | *order changed by Nick, Sept 3* |
 | **4** | Assistant v1 — daily brief → Telegram | |
 | **5** | Email + calendar collectors, read-only | |
@@ -201,3 +202,35 @@ TIERS = {
 No collector may name a model. Swapping models is a one-line change in one
 file. Every call logs tokens and dollars to `costs`. Target recurring spend:
 **under $5/month.** Hard cap in `.env` before any key is live.
+
+### The two refusals
+
+`core.models` runs three gates before a prompt leaves the box: privacy,
+budget, then fallback. The first two **fail closed** and both raise — neither
+warns and proceeds, and neither silently degrades.
+
+**Privacy.** Every provider declares `logs_prompts`. Every job declares
+`data`, which **defaults to `private`**. A private job cannot be routed to a
+logging provider; if its tier offers only logging providers, the call raises
+`PrivacyRefusal`.
+
+The rule comes from the Sept 3 budget memo — *"nothing sensitive goes to a
+free endpoint, ever"* — and it exists because by Phase 5 the email collector
+reads dean correspondence and job applications. The failure being designed
+against is not malice, it is omission: someone adds a collector in six
+months and doesn't think about it. So omission must be the safe case.
+
+Note the flag is `logs_prompts`, not `free`. A local mock is free *and*
+private. A free hosted endpoint is neither.
+
+**Budget.** Month-to-date plus a pessimistic estimate of this call is
+checked against `SPINE_MONTHLY_USD_CAP` **before** the request is sent. Over
+the line raises `BudgetRefusal` and nothing goes out. Same discipline as the
+RAM guard: refuse cheaply rather than discover expensively.
+
+**As shipped:** `bulk` is Gemini free tier (logs prompts, public data only).
+`smart` and `frontier` are deliberately EMPTY — the Anthropic Console
+balance is $0 and no NIM key exists, so there is no non-logging endpoint on
+the box. Empty gives a clear `NoProviders` error; a stand-in would give a
+leak. `MockProvider` is never registered in a production tier, for the same
+reason the console refuses to invent numbers.

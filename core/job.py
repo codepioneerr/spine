@@ -36,6 +36,7 @@ from typing import Any, Callable
 from core import cron
 
 WINDOWS = ("night", "day", "any")
+DATA_CLASSES = ("public", "private")
 WEIGHTS = ("light", "heavy")
 TIERS = (None, "bulk", "smart", "frontier")
 
@@ -50,7 +51,7 @@ _SLUG = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 
 REQUIRED = ("id", "schedule")
 KNOWN = {"id", "schedule", "timeout", "ram_mb", "window", "weight", "tier",
-         "enabled", "description"}
+         "data", "enabled", "description"}
 
 DEFAULTS = {
     "timeout": 900,
@@ -58,6 +59,10 @@ DEFAULTS = {
     "window": "any",
     "weight": "light",
     "tier": None,
+    # DEFAULTS TO PRIVATE, on purpose. A collector must actively declare its
+    # data public before the router will send it to a logging endpoint. The
+    # mistake being designed against is omission, so omission must be safe.
+    "data": "private",
     "enabled": True,
     "description": "",
 }
@@ -76,6 +81,7 @@ class Job:
     window: str
     weight: str
     tier: str | None
+    data: str
     enabled: bool
     description: str
     module: str = ""
@@ -106,6 +112,7 @@ class Job:
             "weight": self.weight,
             "ram_mb": self.ram_mb,
             "tier": self.tier or "—",
+            "data": self.data,
             "enabled": self.enabled,
         }
 
@@ -197,6 +204,13 @@ def validate(meta: dict, module: str = "") -> Job:
             f"{m['id']}{where}: tier must be one of {TIERS}. Jobs request a "
             "tier, never a model name — see CLAUDE.md section 10.")
 
+    if m["data"] not in DATA_CLASSES:
+        raise JobError(
+            f"{m['id']}{where}: data must be one of {DATA_CLASSES}. "
+            "'private' (the default) forbids logging/free endpoints; "
+            "'public' is an explicit statement that this job handles nothing "
+            "of Nick's. See core.models and CLAUDE.md section 10.")
+
     if not isinstance(m["enabled"], bool):
         raise JobError(f"{m['id']}{where}: enabled must be True or False")
     if not isinstance(m["description"], str):
@@ -205,7 +219,8 @@ def validate(meta: dict, module: str = "") -> Job:
     return Job(
         id=m["id"], schedule=m["schedule"], timeout=m["timeout"],
         ram_mb=m["ram_mb"], window=m["window"], weight=m["weight"],
-        tier=m["tier"], enabled=m["enabled"], description=m["description"],
+        tier=m["tier"], data=m["data"], enabled=m["enabled"],
+        description=m["description"],
         module=module,
     )
 
@@ -258,14 +273,19 @@ class Ctx:
 
     @classmethod
     def build(cls, job: Job, log, root: str, dry_run: bool = False) -> "Ctx":
+        # Imported here rather than at module scope: core.models imports
+        # core.costs which opens sqlite, and core.job must stay importable by
+        # the registry without touching the database.
+        from core import http, models
+        secrets = _Secrets(root)
         return cls(
             job=job, log=log, root=root,
             now=datetime.now(timezone.utc), dry_run=dry_run,
-            secrets=_Secrets(root),
+            secrets=secrets,
             db=_Pending("db", "Phase 2 (the item store)"),
-            http=_Pending("http", "Phase 1"),
-            models=_Pending("models", "Phase 1 (the model router)"),
-            notify=_Pending("notify", "Phase 1"),
+            http=http.Http(timeout=30),
+            models=models.for_job(job, secrets=secrets, log=log),
+            notify=_Pending("notify", "Phase 3 (Telegram)"),
         )
 
 

@@ -25,8 +25,14 @@ import sys
 import time
 from datetime import datetime, timezone
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 INNER = 70  # printable columns inside the bezel
+
+# Plain mode drops the bezel, the banner and the bar glyphs, and keeps the
+# numbers. Set by --plain (which is all bin/status does). It is a module flag
+# rather than a parameter threaded through every panel so that the two
+# surfaces cannot drift: same compose(), same data, different dress.
+PLAIN = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,9 +195,21 @@ def db_status():
     path = os.environ.get("SPINE_DB") or os.path.join(
         spine_root(), "var", "spine.db")
     if not os.path.exists(path):
-        return "ABSENT", "item store lands in Phase 2", P.GREEN_D
+        return "ABSENT", "no database yet", P.GREEN_D
     size = os.path.getsize(path) / 2**20
-    return "OK", f"{size:,.1f} MB", P.GREEN
+    try:
+        sys.path.insert(0, spine_root())
+        from core import costs  # type: ignore
+        conn = costs.connect(path)
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        conn.close()
+        has_items = "items" in tables
+        note = f"{size:,.1f} MB · costs" + (
+            " + items" if has_items else "; items lands in Phase 2")
+        return "OK", note, P.GREEN
+    except Exception:
+        return "OK", f"{size:,.1f} MB", P.GREEN
 
 
 def lock_status():
@@ -231,13 +249,16 @@ def load_jobs():
 
 
 def load_spend():
-    """Phase 1 replaces this with a query against the costs table."""
+    """Month-to-date spend, the cap, and the biggest spenders."""
     try:
         sys.path.insert(0, spine_root())
-        from core.costs import month_to_date  # type: ignore
-        return month_to_date(), None
-    except Exception:
-        return None, "cost accounting lands in Phase 1"
+        from core import costs  # type: ignore
+        spent, cap, left = costs.headroom()
+        return {"spent": spent, "cap": cap, "left": left,
+                "jobs": costs.by_job()[:3],
+                "calls": sum(n for _, _, n in costs.by_outcome())}, None
+    except Exception as exc:
+        return None, f"cost accounting unavailable ({type(exc).__name__})"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -256,6 +277,11 @@ def bar(pct, width=24, warn=70.0, crit=88.0):
 
 def metric(label, pct, detail, width=24, warn=70.0, crit=88.0):
     color, glyph = bar(pct, width, warn, crit)
+    if PLAIN:
+        return (Row()
+                .add(f"  {label:<8}", P.GREEN_D)
+                .add(f"{pct:5.1f}%  ", color)
+                .add(detail, P.GREEN_D))
     return (Row()
             .add(f"  {label:<8}", P.GREEN_D)
             .add(glyph, color)
@@ -274,6 +300,8 @@ BANNER = [
 
 
 def header():
+    if PLAIN:
+        return [Row().add(f"SPINE / NickOS  personal OS v{VERSION}", P.GREEN)]
     rows = []
     for i, line in enumerate(BANNER):
         r = Row().add(line, P.GREEN if i < 3 else P.GREEN_D)
@@ -286,6 +314,11 @@ def header():
 
 
 def section(title, note=""):
+    if PLAIN:
+        r = Row().add(f"[ {title} ]", P.GREEN)
+        if note:
+            r.add(f"  {note}", P.GREEN_F)
+        return r
     label = f"┤ {title} ├"
     note = f" {note} " if note else ""
     dashes = INNER - 2 - len(label) - len(note)
@@ -405,14 +438,27 @@ def panel_spend():
     spend, gap = load_spend()
     rows = [section("SPEND")]
     if gap:
-        rows.append(Row().add("  ── ", P.GREEN_F)
-                    .add(gap, P.GREEN_D)
-                    .add("  ── no model calls made", P.GREEN_F))
+        rows.append(Row().add("  -- ", P.GREEN_F).add(gap, P.AMBER))
         return rows
-    cap = float(os.environ.get("SPINE_MONTHLY_USD_CAP", "5.00"))
-    pct = spend / cap * 100 if cap else 0.0
-    rows.append(metric("MTD", pct, f"${spend:.2f} of ${cap:.2f} cap",
+
+    cap = spend["cap"] or 1.0
+    pct = spend["spent"] / cap * 100
+    rows.append(metric("MTD", pct,
+                       f"${spend['spent']:.4f} of ${spend['cap']:.2f} cap",
                        warn=60.0, crit=85.0))
+    if not spend["calls"]:
+        rows.append(Row().add("           no model calls recorded yet",
+                              P.GREEN_F))
+        return rows
+    rows.append(Row()
+                .add(f"           {spend['calls']} call(s) this month · ",
+                     P.GREEN_F)
+                .add(f"${spend['left']:.4f} left", P.CYAN))
+    for job_id, usd, n in spend["jobs"]:
+        rows.append(Row()
+                    .add(f"    {job_id:<14}", P.GREEN_D)
+                    .add(f"${usd:.6f}", P.CYAN)
+                    .add(f"  {n} call(s)", P.GREEN_F))
     return rows
 
 
@@ -497,6 +543,30 @@ def render(scanlines=False):
     return "\n".join(frame(compose(), scanlines))
 
 
+def render_plain():
+    """Same data as the console, no bezel and no color.
+
+    bin/status is a wrapper around this rather than a second implementation,
+    because two surfaces that fetch their own data eventually disagree, and
+    the disagreement is always discovered at the worst moment.
+    """
+    global PLAIN
+    PLAIN = True
+    P.off()
+    try:
+        lines = []
+        for row in compose():
+            text = "".join(t for _, t in row.parts).rstrip()
+            if set(text) and set(text) <= set("-\u2500 "):
+                continue                       # drop horizontal rules
+            lines.append(text)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        return "\n".join(lines).rstrip() + "\n"
+    finally:
+        PLAIN = False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="darkweb",
@@ -508,6 +578,8 @@ def main(argv=None):
                     help="disable ANSI color")
     ap.add_argument("--scanlines", action="store_true",
                     help="CRT scanline effect")
+    ap.add_argument("--plain", action="store_true",
+                    help="plain text, no bezel or color (what bin/status runs)")
     ap.add_argument("--version", action="version", version=f"darkweb {VERSION}")
     args = ap.parse_args(argv)
 
@@ -519,6 +591,11 @@ def main(argv=None):
         sys.stderr.write(
             f"darkweb: terminal is {cols} cols; needs {INNER + 8}. "
             "Widen the window.\n")
+
+    if args.plain:
+        P.off()
+        print(render_plain(), end="")
+        return 0
 
     if args.watch is None:
         print(render(args.scanlines))
