@@ -23,7 +23,18 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 
-DEFAULT_CAP_USD = 5.00
+# Two different numbers doing two different jobs.
+#
+# CAP is the wall: a call that would cross it is refused before sending. It
+# exists so a runaway loop cannot bill you, and it should sit well above
+# normal usage — a cap you brush against monthly is a cap you will raise
+# reflexively, and then it protects nothing.
+#
+# TARGET is the benchmark: what the stack SHOULD cost. Crossing it is
+# information, not an emergency. The SPEND panel measures against this, so
+# the bar reads as "how am I doing" rather than "how close to disaster".
+DEFAULT_CAP_USD = 25.00
+DEFAULT_TARGET_USD = 5.00
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS costs (
@@ -95,11 +106,26 @@ def connect(path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
-def cap_usd() -> float:
+def _money(env_key: str, fallback: float) -> float:
     try:
-        return float(os.environ.get("SPINE_MONTHLY_USD_CAP", DEFAULT_CAP_USD))
+        return float(os.environ.get(env_key, fallback))
     except (TypeError, ValueError):
-        return DEFAULT_CAP_USD
+        return fallback
+
+
+def cap_usd() -> float:
+    """The hard refusal limit."""
+    return _money("SPINE_MONTHLY_USD_CAP", DEFAULT_CAP_USD)
+
+
+def target_usd() -> float:
+    """The number the stack is supposed to cost. Never refuses anything.
+
+    Clamped to the cap: a target above the wall would mean the bar shows
+    plenty of room right up to the moment calls start being refused.
+    """
+    return min(_money("SPINE_MONTHLY_USD_TARGET", DEFAULT_TARGET_USD),
+               cap_usd())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -226,11 +252,20 @@ def recent(limit: int = 20, conn=None) -> list[sqlite3.Row]:
             conn.close()
 
 
-def headroom(now=None, conn=None) -> tuple[float, float, float]:
-    """(spent, cap, remaining) for the current month."""
+def headroom(now=None, conn=None) -> dict:
+    """Where the month stands against both numbers."""
     spent = month_to_date(now, conn)
-    cap = cap_usd()
-    return spent, cap, round(cap - spent, 6)
+    cap, target = cap_usd(), target_usd()
+    return {
+        "spent": spent,
+        "cap": cap,
+        "target": target,
+        "left_to_cap": round(cap - spent, 6),
+        "left_to_target": round(target - spent, 6),
+        "pct_of_target": (spent / target * 100) if target else 0.0,
+        "pct_of_cap": (spent / cap * 100) if cap else 0.0,
+        "over_target": spent > target,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,9 +286,13 @@ def main(argv=None) -> int:
                   + (f"  {r['error']}" if r["error"] else ""))
         return 0
 
-    spent, cap, left = headroom()
-    print(f"month-to-date  ${spent:.4f} of ${cap:.2f} cap "
-          f"(${left:.4f} left)")
+    h = headroom()
+    flag = "  OVER TARGET" if h["over_target"] else ""
+    print(f"month-to-date  ${h['spent']:.4f}")
+    print(f"  target       ${h['target']:.2f}   "
+          f"({h['pct_of_target']:.1f}% used){flag}")
+    print(f"  hard cap     ${h['cap']:.2f}   "
+          f"(${h['left_to_cap']:.4f} before calls are refused)")
     jobs = by_job()
     if not jobs:
         print("no model calls recorded")

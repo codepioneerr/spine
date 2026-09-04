@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+bin/audit-perplexity — illuminate the Perplexity blind spot.
+
+## Why this is not the script that was asked for
+
+The directive said: pull usage logs from the Perplexity API since May.
+**That endpoint does not exist.**
+
+Checked Sept 4 2026. Perplexity returns per-call cost inside each API
+response (added Aug 2025), but there is no documented endpoint for billing
+history, invoices, credits, or aggregate spend. A community feature request
+for a `billing:read` OAuth scope was acknowledged by Perplexity staff with
+no commitment and no timeline; the workaround the thread describes is
+"trace spend to an API key by matching the key suffix in invoices" — by
+hand, in the dashboard.
+
+So historical spend cannot be fetched. What CAN be done, and what this
+script does:
+
+  1. Count the calls that actually happened, from the box's own evidence —
+     logs, SQLite databases, report files left behind by darkweb-jobs.
+  2. Price that call volume against published Perplexity rates.
+  3. State plainly what the estimate cannot know.
+
+The exact figure lives in one place: https://www.perplexity.ai/settings/api
+Two minutes with your own eyes beats any estimate this can produce. This
+script exists to tell you the *shape* of the spend — order of magnitude,
+which month, how many calls — so you know whether that trip is urgent.
+
+## Safety
+
+Read-only. Opens no sockets, needs no key, writes nothing. It reads files
+that may CONTAIN keys, so every line it prints goes through redact() first.
+If you ever see something key-shaped in this output, that is a bug worth
+reporting, not a formatting quirk.
+
+    bin/audit-perplexity                    scan the usual places
+    bin/audit-perplexity --root ~/other     scan somewhere else
+    bin/audit-perplexity --since 2026-05    change the window
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sqlite3
+import sys
+from collections import Counter
+
+# Published Perplexity rates, USD per million tokens (input, output).
+# Sources: cloudzero.com/blog/perplexity-api-pricing, aipricing.guru.
+# Checked Sept 4 2026 — re-verify before trusting a number from here.
+TOKEN_RATES = {
+    "sonar":               (1.00, 1.00),
+    "sonar-pro":           (3.00, 15.00),
+    "sonar-reasoning-pro": (2.00, 8.00),
+    "sonar-deep-research": (2.00, 8.00),
+}
+
+# The part people forget. Search-enabled requests carry a PER-REQUEST fee on
+# top of tokens, and at low token counts it dominates completely — a small
+# query can cost 10x more in request fees than in tokens. Published figures
+# cluster around $5/1000 for plain Sonar and $14-22/1000 for Pro Search.
+REQUEST_FEE_USD = {"low": 0.005, "high": 0.022}
+
+# Rough shape of one trading-bot research query, from the budget memo's
+# description (8-12 queries per run, 2 runs/day).
+ASSUMED_TOKENS_IN = 400
+ASSUMED_TOKENS_OUT = 600
+
+CANDIDATE_ROOTS = ["~/darkweb-jobs", "~/hermes", "~/collectors", "~/spine"]
+
+PPLX = re.compile(r"perplexity|pplx|sonar", re.I)
+
+# Anything that could be a credential. Deliberately greedy — a false positive
+# costs a masked line, a false negative costs a leaked key.
+SECRET_PATTERNS = [
+    re.compile(r"pplx-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
+    # NOT \b before the keyword: TELEGRAM_BOT_TOKEN has a word character
+    # before TOKEN, so \b never fires and the token sails through. Found by
+    # probing the redactor with real key shapes rather than trusting it.
+    re.compile(r"(?i)[A-Za-z0-9_\-]*(api[_-]?key|token|secret|passwd|password"
+               r"|bearer|authorization)\s*[=:]\s*"
+               r"['\"]?[A-Za-z0-9_\-\.:]{8,}"),
+    re.compile(r"\b[A-Za-z0-9_\-]{32,}\b"),
+]
+
+
+def redact(text: str) -> str:
+    """Mask anything credential-shaped before it reaches a terminal."""
+    for pat in SECRET_PATTERNS:
+        text = pat.sub(lambda m: m.group(0)[:6] + "…[redacted]", text)
+    return text
+
+
+def expand(p: str) -> str:
+    return os.path.abspath(os.path.expanduser(p))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# evidence gathering
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_call_sites(root: str) -> list[tuple[str, int, str]]:
+    """Where in the code Perplexity is actually invoked."""
+    hits = []
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in {".git", "__pycache__", "node_modules",
+                                    ".venv", "venv"}]
+        for name in files:
+            if not name.endswith((".py", ".sh", ".js", ".ts", ".json", ".yaml",
+                                  ".yml", ".toml", ".md")):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                with open(path, errors="replace") as fh:
+                    for n, line in enumerate(fh, 1):
+                        if PPLX.search(line):
+                            hits.append((path, n, redact(line.strip()[:140])))
+            except (OSError, UnicodeError):
+                continue
+    return hits
+
+
+def scan_logs(root: str, since: str) -> Counter:
+    """Count Perplexity-ish log lines per month."""
+    per_month = Counter()
+    stamp = re.compile(r"(20\d{2})-(\d{2})-\d{2}")
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in {".git", "__pycache__"}]
+        for name in files:
+            if not (name.endswith(".log") or name.endswith(".jsonl")
+                    or "log" in dirpath.split(os.sep)[-1:]):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                with open(path, errors="replace") as fh:
+                    for line in fh:
+                        if not PPLX.search(line):
+                            continue
+                        m = stamp.search(line)
+                        key = f"{m.group(1)}-{m.group(2)}" if m else "undated"
+                        if key == "undated" or key >= since:
+                            per_month[key] += 1
+            except OSError:
+                continue
+    return per_month
+
+
+def scan_sqlite(root: str, since: str) -> list[tuple[str, str, int, Counter]]:
+    """Look inside any SQLite file for tables that smell like call records."""
+    found = []
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in {".git", "__pycache__"}]
+        for name in files:
+            if not name.endswith((".db", ".sqlite", ".sqlite3")):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
+                                       timeout=5)
+                conn.row_factory = sqlite3.Row
+                tables = [r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")]
+                for table in tables:
+                    cols = [r[1] for r in conn.execute(
+                        f"PRAGMA table_info('{table}')")]
+                    textish = [c for c in cols if c.lower() not in
+                               ("id", "rowid")]
+                    if not textish:
+                        continue
+                    where = " OR ".join(
+                        f"CAST(\"{c}\" AS TEXT) LIKE '%perplexity%' "
+                        f"OR CAST(\"{c}\" AS TEXT) LIKE '%sonar%'"
+                        for c in textish[:12])
+                    try:
+                        n = conn.execute(
+                            f"SELECT COUNT(*) FROM \"{table}\" WHERE {where}"
+                        ).fetchone()[0]
+                    except sqlite3.Error:
+                        continue
+                    if not n:
+                        continue
+                    months = Counter()
+                    tcol = next((c for c in cols
+                                 if c.lower() in ("ts", "created_at", "date",
+                                                  "timestamp", "time")), None)
+                    if tcol:
+                        try:
+                            for r in conn.execute(
+                                    f"SELECT substr(CAST(\"{tcol}\" AS TEXT),1,7) "
+                                    f"AS m, COUNT(*) c FROM \"{table}\" "
+                                    f"WHERE {where} GROUP BY m"):
+                                if r["m"] and str(r["m"]) >= since:
+                                    months[str(r["m"])] += r["c"]
+                        except sqlite3.Error:
+                            pass
+                    found.append((path, table, n, months))
+                conn.close()
+            except sqlite3.Error:
+                continue
+    return found
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def estimate_cost(calls: int) -> dict:
+    tin, tout = ASSUMED_TOKENS_IN, ASSUMED_TOKENS_OUT
+    out = {}
+    for model, (ri, ro) in TOKEN_RATES.items():
+        tokens = calls * ((tin / 1e6) * ri + (tout / 1e6) * ro)
+        out[model] = {
+            "tokens_only": round(tokens, 4),
+            "with_low_fee": round(tokens + calls * REQUEST_FEE_USD["low"], 4),
+            "with_high_fee": round(tokens + calls * REQUEST_FEE_USD["high"], 4),
+        }
+    return out
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="audit-perplexity")
+    ap.add_argument("--root", action="append", default=None,
+                    help="directory to scan (repeatable)")
+    ap.add_argument("--since", default="2026-05", metavar="YYYY-MM")
+    ap.add_argument("--assume-calls", type=int, default=None,
+                    help="skip discovery and price this many calls")
+    args = ap.parse_args(argv)
+
+    roots = [expand(r) for r in (args.root or CANDIDATE_ROOTS)]
+    roots = [r for r in roots if os.path.isdir(r)]
+
+    print("=" * 72)
+    print("PERPLEXITY SPEND AUDIT")
+    print("=" * 72)
+    print("Read-only. No network. No key required. Output is redacted.")
+    print()
+
+    if args.assume_calls is None:
+        if not roots:
+            print("No candidate directories found. Try --root <path>.")
+            return 1
+        print("scanning:", ", ".join(roots))
+        print()
+
+        sites, logs, dbs = [], Counter(), []
+        for r in roots:
+            sites += find_call_sites(r)
+            logs += scan_logs(r, args.since)
+            dbs += scan_sqlite(r, args.since)
+
+        print("-- CALL SITES " + "-" * 58)
+        if sites:
+            for path, n, line in sites[:25]:
+                print(f"  {path}:{n}")
+                print(f"      {line}")
+            if len(sites) > 25:
+                print(f"  ... and {len(sites) - 25} more references")
+        else:
+            print("  none found — Perplexity may be called from somewhere")
+            print("  this scan cannot see (e.g. a Cowork task prompt).")
+        print()
+
+        print("-- LOG EVIDENCE " + "-" * 56)
+        if logs:
+            for month in sorted(logs):
+                print(f"  {month}   {logs[month]:>6} matching line(s)")
+        else:
+            print("  no matching log lines found")
+        print()
+
+        print("-- DATABASE EVIDENCE " + "-" * 51)
+        if dbs:
+            for path, table, n, months in dbs:
+                print(f"  {path} :: {table}   {n} row(s)")
+                for m in sorted(months):
+                    print(f"      {m}  {months[m]}")
+        else:
+            print("  no matching rows found")
+        print()
+
+        calls = sum(logs.values()) + sum(n for _, _, n, _ in dbs)
+    else:
+        calls = args.assume_calls
+        print(f"pricing {calls} assumed call(s), discovery skipped")
+        print()
+
+    print("-- COST ESTIMATE " + "-" * 55)
+    if not calls:
+        print("  No call evidence found on this box.")
+        print()
+        print("  That is NOT the same as 'no spend'. The budget memo says the")
+        print("  trading bot calls Perplexity twice a day at 8-12 queries per")
+        print("  run. If that is still true, the calls are happening from")
+        print("  somewhere this scan cannot reach — most likely a Cowork")
+        print("  scheduled task, whose prompt holds the key.")
+        print()
+        print("  Price that pattern directly:")
+        print("      bin/audit-perplexity --assume-calls 600   # ~1 month")
+    else:
+        print(f"  {calls} call(s) found since {args.since}")
+        print(f"  assuming ~{ASSUMED_TOKENS_IN} tokens in / "
+              f"{ASSUMED_TOKENS_OUT} out per call\n")
+        print(f"  {'model':<22}{'tokens only':>14}{'+ req fee low':>16}"
+              f"{'+ req fee high':>16}")
+        for model, e in estimate_cost(calls).items():
+            print(f"  {model:<22}"
+                  f"{('$%.2f' % e['tokens_only']):>14}"
+                  f"{('$%.2f' % e['with_low_fee']):>16}"
+                  f"{('$%.2f' % e['with_high_fee']):>16}")
+        print()
+        print("  Note which column moves. For short search queries the")
+        print("  PER-REQUEST fee dominates the token cost — often by 10x.")
+        print("  A token-only estimate of this workload is not conservative,")
+        print("  it is wrong.")
+    print()
+
+    print("-- WHAT THIS CANNOT KNOW " + "-" * 47)
+    print("  Perplexity publishes no billing or usage endpoint. Per-call cost")
+    print("  comes back inside each API response, but historical spend is")
+    print("  dashboard-only. A `billing:read` scope was requested by the")
+    print("  community and acknowledged by staff with no timeline.")
+    print()
+    print("  So this is call-volume archaeology priced at list rates. It")
+    print("  cannot see: which model was actually used, real token counts,")
+    print("  request fees actually charged, or credits and discounts.")
+    print()
+    print("  THE EXACT NUMBER:  https://www.perplexity.ai/settings/api")
+    print("  Two minutes with your own eyes. This script tells you whether")
+    print("  that trip is urgent, not what you will find when you take it.")
+    print()
+    print("-- THE ACTUAL FIX " + "-" * 54)
+    print("  Perplexity returns cost per call in its response JSON. Once the")
+    print("  trading bot moves onto Spine (Phase 6), route it through")
+    print("  core.models and that figure lands in the costs table like")
+    print("  everything else. Then this script is never needed again — which")
+    print("  is the point. Auditing is what you do to a system that does not")
+    print("  measure itself.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

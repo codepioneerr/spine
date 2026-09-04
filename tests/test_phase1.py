@@ -40,6 +40,7 @@ class DbCase(unittest.TestCase):
         self._old = dict(os.environ)
         os.environ["SPINE_DB"] = self._db
         os.environ["SPINE_MONTHLY_USD_CAP"] = "5.00"
+        os.environ["SPINE_MONTHLY_USD_TARGET"] = "5.00"
 
     def tearDown(self):
         os.environ.clear()
@@ -105,13 +106,32 @@ class TestCostsTable(DbCase):
         self.assertEqual(costs.month_to_date(), 0.0)
         self.assertEqual(len(costs.recent(10)), 1)
 
-    def test_headroom(self):
+    def test_headroom_reports_cap_and_target_separately(self):
+        os.environ["SPINE_MONTHLY_USD_CAP"] = "25.00"
+        os.environ["SPINE_MONTHLY_USD_TARGET"] = "5.00"
         costs.record("j", "bulk", "mock", "claude-haiku-4.5",
-                     tokens_in=2_000_000, tokens_out=0)
-        spent, cap, left = costs.headroom()
-        self.assertAlmostEqual(spent, 2.0)
-        self.assertAlmostEqual(cap, 5.0)
-        self.assertAlmostEqual(left, 3.0)
+                     tokens_in=6_000_000, tokens_out=0)     # $6 — over target
+        h = costs.headroom()
+        self.assertAlmostEqual(h["spent"], 6.0)
+        self.assertAlmostEqual(h["cap"], 25.0)
+        self.assertAlmostEqual(h["target"], 5.0)
+        self.assertTrue(h["over_target"])
+        self.assertAlmostEqual(h["left_to_cap"], 19.0)
+
+    def test_over_target_does_not_refuse_calls(self):
+        """The target is a benchmark. Only the cap refuses."""
+        os.environ["SPINE_MONTHLY_USD_CAP"] = "25.00"
+        os.environ["SPINE_MONTHLY_USD_TARGET"] = "1.00"
+        costs.record("j", "bulk", "mock", "claude-haiku-4.5",
+                     tokens_in=2_000_000, tokens_out=0)     # $2 — 2x target
+        r = self.router({"bulk": [MockProvider()]}, data="private")
+        self.assertTrue(r.complete("still allowed", tier="bulk").text)
+
+    def test_target_cannot_exceed_the_cap(self):
+        """Otherwise the bar shows room right up to the refusal."""
+        os.environ["SPINE_MONTHLY_USD_CAP"] = "5.00"
+        os.environ["SPINE_MONTHLY_USD_TARGET"] = "50.00"
+        self.assertEqual(costs.target_usd(), 5.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -231,6 +251,7 @@ class TestBudgetGate(DbCase):
 
     def test_cap_allows_a_call_that_fits(self):
         os.environ["SPINE_MONTHLY_USD_CAP"] = "5.00"
+        os.environ["SPINE_MONTHLY_USD_TARGET"] = "5.00"
         r = self.router({"bulk": [MockProvider()]}, data="private")
         self.assertTrue(r.complete("hello", tier="bulk").text)
 
@@ -336,3 +357,53 @@ class TestPlainSurface(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAuditRedaction(unittest.TestCase):
+    """The audit reads files that contain live keys and prints what it finds.
+
+    Redaction is therefore not a nicety — it is the only thing standing
+    between `bin/audit-perplexity` and a key in a screenshot. The first
+    version of the pattern missed TELEGRAM_BOT_TOKEN because \\b does not
+    fire after an underscore. Probe it with real shapes, not invented ones.
+    """
+
+    def setUp(self):
+        import importlib.machinery
+        import importlib.util
+        path = os.path.join(ROOT, "bin", "audit-perplexity")
+        spec = importlib.util.spec_from_loader(
+            "audit", importlib.machinery.SourceFileLoader("audit", path))
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def test_masks_every_key_shape_on_this_box(self):
+        secrets = [
+            ("pplx", 'PPLX_KEY = "pplx-abc123def456ghi789jkl012"'),
+            ("anthropic", "ANTHROPIC_API_KEY=sk-ant-api03-XXXXXXXXXXXXXXXX"),
+            ("telegram", "export TELEGRAM_BOT_TOKEN=8123456789:AAF-abcdefgh"),
+            ("alpaca", "ALPACA_SECRET_KEY: aBcDeFgHiJkLmNoPqRsTuVwXyZ012345"),
+            ("bearer", 'headers={"Authorization": "Bearer sk-proj-9f8e7d6c5b"}'),
+            ("gemini", "GEMINI_API_KEY=AIzaSyD-1234567890abcdefghijklmnop"),
+        ]
+        for label, line in secrets:
+            out = self.mod.redact(line)
+            self.assertIn("[redacted]", out, f"{label} was not masked: {out}")
+            tail = line.split("=")[-1].split(":")[-1].strip().strip('"')
+            self.assertNotIn(tail[8:], out,
+                             f"{label} leaked its tail: {out}")
+
+    def test_leaves_ordinary_lines_alone(self):
+        for benign in ('model="sonar-pro", temperature=0.2',
+                       "https://api.perplexity.ai/chat/completions",
+                       "def research(query):"):
+            self.assertEqual(self.mod.redact(benign), benign)
+
+    def test_audit_is_read_only_and_offline(self):
+        """No sockets, no writes. It runs against a box holding live keys."""
+        with open(os.path.join(ROOT, "bin", "audit-perplexity")) as fh:
+            src = fh.read()
+        for forbidden in ("urllib.request", "requests.", "socket.",
+                          "http.client"):
+            self.assertNotIn(forbidden, src)
+        self.assertIn("mode=ro", src)   # sqlite opened read-only

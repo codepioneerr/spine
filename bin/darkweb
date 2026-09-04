@@ -253,10 +253,10 @@ def load_spend():
     try:
         sys.path.insert(0, spine_root())
         from core import costs  # type: ignore
-        spent, cap, left = costs.headroom()
-        return {"spent": spent, "cap": cap, "left": left,
-                "jobs": costs.by_job()[:3],
-                "calls": sum(n for _, _, n in costs.by_outcome())}, None
+        h = costs.headroom()
+        h["jobs"] = costs.by_job()[:3]
+        h["calls"] = sum(n for _, _, n in costs.by_outcome())
+        return h, None
     except Exception as exc:
         return None, f"cost accounting unavailable ({type(exc).__name__})"
 
@@ -441,19 +441,30 @@ def panel_spend():
         rows.append(Row().add("  -- ", P.GREEN_F).add(gap, P.AMBER))
         return rows
 
-    cap = spend["cap"] or 1.0
-    pct = spend["spent"] / cap * 100
-    rows.append(metric("MTD", pct,
-                       f"${spend['spent']:.4f} of ${spend['cap']:.2f} cap",
-                       warn=60.0, crit=85.0))
+    # Measured against the TARGET, not the cap. The bar answers "how am I
+    # doing against what this should cost", which is a question worth asking
+    # monthly. The cap is a wall, not a goal, and a bar that sits at 4% all
+    # month teaches you to ignore it.
+    rows.append(metric("MTD", spend["pct_of_target"],
+                       f"${spend['spent']:.4f} of ${spend['target']:.2f} target",
+                       warn=80.0, crit=100.0))
+    over = spend["over_target"]
+    rows.append(Row()
+                .add("           hard cap ", P.GREEN_F)
+                .add(f"${spend['cap']:.2f}", P.CYAN)
+                .add(f" · ${spend['left_to_cap']:.4f} before calls refuse",
+                     P.GREEN_F))
+    if over:
+        rows.append(Row()
+                    .add("           OVER TARGET", P.AMBER)
+                    .add(f" by ${-spend['left_to_target']:.4f} — worth a look, "
+                         "not an outage", P.GREEN_F))
     if not spend["calls"]:
         rows.append(Row().add("           no model calls recorded yet",
                               P.GREEN_F))
         return rows
-    rows.append(Row()
-                .add(f"           {spend['calls']} call(s) this month · ",
-                     P.GREEN_F)
-                .add(f"${spend['left']:.4f} left", P.CYAN))
+    rows.append(Row().add(f"           {spend['calls']} call(s) this month",
+                          P.GREEN_F))
     for job_id, usd, n in spend["jobs"]:
         rows.append(Row()
                     .add(f"    {job_id:<14}", P.GREEN_D)
