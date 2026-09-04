@@ -45,12 +45,18 @@ def run(ctx):
     counted by the console — the shape is right, the sink comes later.
     """
     ctx.log("heartbeat: reading box vitals")
+    # data="private" by default and this job makes no model call, so nothing
+    # here ever leaves the box.
 
     load1, load5, load15 = os.getloadavg()
     item = {
         "source": "heartbeat",
         "kind": "fact",
-        "key": f"heartbeat:{int(time.time() // 1800)}",  # dedups per window
+        # One row per 30-minute window. Re-running inside the same window
+        # updates that row rather than creating another — which is exactly
+        # the dedup behaviour every collector relies on, demonstrated in the
+        # simplest possible case.
+        "key": f"heartbeat:{int(time.time() // 1800)}",
         "title": f"{platform.node()} alive",
         "data": {
             "host": platform.node(),
@@ -60,5 +66,11 @@ def run(ctx):
         },
     }
 
+    # Phase 2: write through ctx.db. The runner still counts what comes back
+    # in "items", so the return shape is unchanged — but the row now lands in
+    # the item store, and the console reads it from there.
+    result = ctx.db.put(item)
+    ctx.log(f"item store: {result['new']} new, {result['updated']} updated")
+
     return {"items": [item],
-            "stats": {"load1": round(load1, 2)}}
+            "stats": {"load1": round(load1, 2), **result}}

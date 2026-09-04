@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+#
+# bin/items — read and act on the item store from the terminal.
+#
+# Until the Telegram surface lands in Phase 3, this is how you move things
+# through the queue. `new` -> `acted` is the loop the whole assistant is
+# built around; it should be usable before the assistant exists.
+#
+exec python3 -m core.items "$@"

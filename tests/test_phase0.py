@@ -343,16 +343,19 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(state["outcome"], "ok")
 
     def test_pending_capabilities_name_their_phase(self):
+        """Capabilities not yet built name the phase that delivers them,
+        rather than raising AttributeError three frames deep. ctx.db went
+        live in Phase 2; notify is the one still pending."""
         seen = {}
 
         def peek(ctx):
             try:
-                ctx.db.query("select 1")
+                ctx.notify.send("hi")
             except NotImplementedError as exc:
                 seen["msg"] = str(exc)
             return {}
         runner.run_job(self._job(peek), log=self.log)
-        self.assertIn("Phase 2", seen["msg"])
+        self.assertIn("Phase 3", seen["msg"])
 
 
 class TestRunShell(unittest.TestCase):

@@ -276,13 +276,13 @@ class Ctx:
         # Imported here rather than at module scope: core.models imports
         # core.costs which opens sqlite, and core.job must stay importable by
         # the registry without touching the database.
-        from core import http, models
+        from core import http, models, store
         secrets = _Secrets(root)
         return cls(
             job=job, log=log, root=root,
             now=datetime.now(timezone.utc), dry_run=dry_run,
             secrets=secrets,
-            db=_Pending("db", "Phase 2 (the item store)"),
+            db=store.Store(source=job.id),
             http=http.Http(timeout=30),
             models=models.for_job(job, secrets=secrets, log=log),
             notify=_Pending("notify", "Phase 3 (Telegram)"),

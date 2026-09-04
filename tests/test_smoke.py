@@ -85,11 +85,13 @@ class TestConsole(unittest.TestCase):
     def test_reports_gaps_instead_of_inventing_numbers(self):
         self.dw.P.off()
         out = self.dw.render()
-        # Panels that are BUILT show real data...
+        # Every panel is now built, so every panel shows real data or an
+        # honest empty state — never an invented number.
         self.assertIn("heartbeat", out)          # registry, Phase 0
         self.assertIn("cap", out)                # cost accounting, Phase 1
-        # ...and the one that is not still names the phase that fills it.
-        self.assertIn("Phase 2", out)            # the item store
+        self.assertIn("ITEM STORE", out)         # the item store, Phase 2
+        for invented in ("TODO", "example.com", "lorem", "0.00 of 0.00"):
+            self.assertNotIn(invented, out)
 
     def test_runs_as_a_subprocess(self):
         r = subprocess.run([sys.executable, DARKWEB, "--no-color"],

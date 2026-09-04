@@ -326,13 +326,21 @@ class TestContractIntegration(DbCase):
         self.assertEqual(ctx.models.data, "public")
         self.assertTrue(hasattr(ctx.http, "get_json"))
 
-    def test_db_still_pending_until_phase_2(self):
+    def test_ctx_db_is_a_store_bound_to_the_job(self):
+        """Phase 2: ctx.db is live, and its source comes from the job id —
+        a collector cannot mislabel where its items came from."""
         from core.job import Ctx
         j = validate({"id": "x4", "schedule": "0 6 * * *"})
         ctx = Ctx.build(j, lambda *a, **k: None, ROOT)
+        self.assertEqual(ctx.db.source, "x4")
+
+    def test_notify_still_pending_until_phase_3(self):
+        from core.job import Ctx
+        j = validate({"id": "x5", "schedule": "0 6 * * *"})
+        ctx = Ctx.build(j, lambda *a, **k: None, ROOT)
         with self.assertRaises(NotImplementedError) as e:
-            ctx.db.query("select 1")
-        self.assertIn("Phase 2", str(e.exception))
+            ctx.notify.send("hi")
+        self.assertIn("Phase 3", str(e.exception))
 
 
 class TestPlainSurface(unittest.TestCase):

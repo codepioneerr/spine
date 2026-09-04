@@ -113,7 +113,8 @@ function for clean secrets handling rather than a claim that it's finished.
 | Step 1 | repo, rules, console surface | ✅ |
 | 0 | job contract · crontab registry · runner · RAM guard | ✅ |
 | 1 | model router · cost accounting · `bin/status` | ✅ |
-| 2 | the item store | next |
+| 2a | the item store | ✅ |
+| 2b | migrate the legacy collectors | next |
 | 3 | proptech collector | |
 | 4 | assistant v1 — daily brief | |
 | 5 | email + calendar, read-only | |
@@ -126,6 +127,8 @@ git clone <this repo> && cd spine
 cp .env.example .env && chmod 600 .env
 bin/darkweb                          # the console
 bin/darkweb --watch                  # live
+bin/items                            # the unacted queue
+bin/items --act 42                   # mark something dealt with
 bin/status                           # same data, plain text, greppable
 python3 -m core.costs --month        # spend by job and tier
 python3 -m core.registry --list      # what is registered

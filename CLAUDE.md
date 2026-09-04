@@ -152,6 +152,37 @@ The assistant **observes and proposes. Nick acts.**
 
 ---
 
+## 7a. The item store
+
+One table. Every collector writes into it; the assistant reads across it.
+
+    items(id, ts, updated_ts, source, kind, key, title, body, url,
+          data_json, importance, status, acted_at)
+          kind:   signal | deal | task | alert | fact
+          status: new | seen | acted | dismissed
+          UNIQUE(source, key)
+
+**`UNIQUE(source, key)` is what lets collectors be dumb.** They emit
+everything they see on every run; the store decides what is actually new.
+Choosing `key` is therefore the only hard part of writing a collector: it
+must be stable across runs for the same real-world thing. A document number
+is a good key. A row index is not.
+
+**On conflict, `ts` / `status` / `acted_at` are preserved.** First-seen
+stays first-seen, so a contract that moves every 30 minutes does not keep
+resetting its own age. And something already acted on does not return to
+the queue because a collector re-emitted it — if it did, everything Nick
+had dealt with would reappear in tomorrow's brief, and he would stop
+reading the brief.
+
+`ctx.db` is bound to the job, so `source` comes from the job id. A
+collector cannot mislabel where its items came from, because it never gets
+to say — the same reasoning as `ctx.models` taking privacy from META.
+
+Retention is per-kind (`core.store.RETENTION_DAYS`). **Acted items are
+never pruned**: they are the record of what Nick actually did, they cost
+nothing to keep, and they would hurt to lose.
+
 ## 8. Layer map
 
 ```
@@ -176,7 +207,8 @@ that stops silo #11.
 | **Step 1** | Repo, rules, `bin/darkweb` cyber surface | ✅ this commit |
 | **0** | Job contract · registry generates crontab · `run.sh` + flock · windows + RAM guard | ✅ complete |
 | **1** | Model router (tiers, not model names) · cost accounting · `bin/status` | ✅ complete |
-| **2** | Item store · reimplement the 3 collectors · retire darkweb-jobs | awaiting approval |
+| **2a** | Item store (`items`), `ctx.db`, `bin/items`, heartbeat migrated | ✅ complete |
+| **2b** | Reimplement acris/polymarket/eventbot · retire darkweb-jobs | **BLOCKED — need the darkweb-jobs source** |
 | **3** | **Proptech collector** (ACRIS/PLUTO depth) | *order changed by Nick, Sept 3* |
 | **4** | Assistant v1 — daily brief → Telegram | |
 | **5** | Email + calendar collectors, read-only | |

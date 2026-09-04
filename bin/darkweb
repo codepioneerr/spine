@@ -208,8 +208,8 @@ def db_status():
             "SELECT name FROM sqlite_master WHERE type='table'")}
         conn.close()
         has_items = "items" in tables
-        note = f"{size:,.1f} MB · costs" + (
-            " + items" if has_items else "; items lands in Phase 2")
+        note = f"{size:,.1f} MB · " + ("costs + items" if has_items
+                                       else "costs only")
         return "OK", note, P.GREEN
     except Exception:
         return "OK", f"{size:,.1f} MB", P.GREEN
@@ -249,6 +249,21 @@ def load_jobs():
         return list(all_jobs()), None
     except Exception:
         return [], "registry lands in Phase 0"
+
+
+def load_items():
+    """Item store summary for the console."""
+    try:
+        sys.path.insert(0, spine_root())
+        from core import store  # type: ignore
+        st = store.Store()
+        total = st.total()
+        out = {"total": total, "counts": st.counts(),
+               "sources": st.by_source()[:4]}
+        st.close()
+        return out, None
+    except Exception as exc:
+        return None, f"item store unavailable ({type(exc).__name__})"
 
 
 def load_spend():
@@ -437,6 +452,33 @@ def panel_jobs():
     return rows
 
 
+def panel_items():
+    items, gap = load_items()
+    rows = [section("ITEM STORE")]
+    if gap:
+        rows.append(Row().add("  -- ", P.GREEN_F).add(gap, P.AMBER))
+        return rows
+    if not items["total"]:
+        rows.append(Row().add("  empty — no collector has written an item yet",
+                              P.GREEN_D))
+        return rows
+
+    c = items["counts"]
+    rows.append(Row()
+                .add(f"  {items['total']} item(s)   ", P.WHITE)
+                .add(f"new {c.get('new', 0)}  ", P.CYAN)
+                .add(f"seen {c.get('seen', 0)}  ", P.GREEN_D)
+                .add(f"acted {c.get('acted', 0)}  ", P.GREEN_D)
+                .add(f"dismissed {c.get('dismissed', 0)}", P.GREEN_F))
+    for src, n, last in items["sources"]:
+        stamp = last[5:16].replace("T", " ") if last and "T" in last else "-"
+        rows.append(Row()
+                    .add(f"    {src:<14}", P.GREEN_D)
+                    .add(f"{n:>6}", P.CYAN)
+                    .add(f"   last {stamp}", P.GREEN_F))
+    return rows
+
+
 def panel_spend():
     spend, gap = load_spend()
     rows = [section("SPEND")]
@@ -545,6 +587,8 @@ def compose():
     rows += panel_integrity()
     rows.append(blank())
     rows += panel_jobs()
+    rows.append(blank())
+    rows += panel_items()
     rows.append(blank())
     rows += panel_spend()
     rows += panel_footer()
