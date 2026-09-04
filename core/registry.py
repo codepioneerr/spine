@@ -40,9 +40,7 @@ BEGIN = "# >>> spine: managed block, do not edit by hand >>>"
 END = "# <<< spine: managed block <<<"
 
 
-def root() -> str:
-    return os.environ.get("SPINE_ROOT") or os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__)))
+from core.paths import root  # noqa: F401  (re-exported for callers)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

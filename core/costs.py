@@ -72,6 +72,12 @@ PRICING: dict[str, tuple[float, float]] = {
     # matters even when "how many dollars" is zero.
     "mock":                  (0.00, 0.00),
     "nvidia-nim-free":       (0.00, 0.00),
+    # The Google AI Studio FREE tier costs nothing. Pricing it at the paid
+    # list rate would inflate month-to-date with dollars that were never
+    # charged, and the cap — which refuses on that number — would eventually
+    # block calls that cost $0. An accounting table that overstates is as
+    # broken as one that understates.
+    "gemini-free-tier":      (0.00, 0.00),
 }
 
 
@@ -82,13 +88,7 @@ class UnknownModel(KeyError):
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def root() -> str:
-    return os.environ.get("SPINE_ROOT") or os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__)))
-
-
-def db_path() -> str:
-    return os.environ.get("SPINE_DB") or os.path.join(root(), "var", "spine.db")
+from core.paths import db_path, root  # noqa: F401  (re-exported)
 
 
 def connect(path: str | None = None) -> sqlite3.Connection:

@@ -98,6 +98,15 @@ class Provider:
     free: bool = False
     logs_prompts: bool = True
     key_env: str | None = None
+    # What core.costs bills this call as, when that differs from the model
+    # string sent to the API. A free tier costs $0 no matter which model it
+    # serves; billing it at list rate would inflate month-to-date and make
+    # the cap refuse calls that cost nothing.
+    price_model: str | None = None
+
+    @property
+    def billed_as(self) -> str:
+        return self.price_model or self.model
 
     def available(self, secrets=None) -> tuple[bool, str]:
         if self.key_env is None:
@@ -151,10 +160,14 @@ class GeminiProvider(Provider):
     ENDPOINT = ("https://generativelanguage.googleapis.com/v1beta/"
                 "models/{model}:generateContent")
 
-    def __init__(self, model="gemini-2.5-flash-lite",
-                 key_env="GEMINI_API_KEY", name="gemini_free"):
-        super().__init__(name=name, model=model, free=True,
-                         logs_prompts=True, key_env=key_env)
+    def __init__(self, model="gemini-3.5-flash-lite",
+                 key_env="GEMINI_API_KEY", name="gemini_free", free=True):
+        # 2.5-flash-lite returned 404 against Nick's AI Studio key on
+        # Sept 4 2026 — the model string is not universally available. 3.5
+        # is what that key actually serves.
+        super().__init__(name=name, model=model, free=free,
+                         logs_prompts=True, key_env=key_env,
+                         price_model="gemini-free-tier" if free else None)
 
     def complete(self, prompt, *, max_tokens, timeout, secrets=None):
         key = (secrets.get(self.key_env) if secrets
@@ -279,7 +292,7 @@ class Router:
                 last = ModelError(f"{provider.name}: {why}")
                 continue
 
-            self.check_budget(provider.model, prompt)
+            self.check_budget(provider.billed_as, prompt)
 
             started = time.monotonic()
             try:
@@ -294,21 +307,21 @@ class Router:
 
             ms = int((time.monotonic() - started) * 1000)
             usd = costs.record(
-                self.job, tier, provider.name, provider.model,
+                self.job, tier, provider.name, provider.billed_as,
                 tokens_in=tin, tokens_out=tout, latency_ms=ms,
                 outcome="ok", conn=self.conn)
             if self.log:
                 self.log(f"model ok  tier={tier} provider={provider.name} "
                          f"in={tin} out={tout} ${usd:.6f} {ms}ms")
             return Completion(text, tin, tout, provider.name, provider.model,
-                              ms, usd)
+                              ms, usd)   # .model = what was actually called
 
         raise ModelError(
             f"tier {tier!r}: every provider failed. Last error: {last}")
 
     def _note(self, tier, provider, outcome, error, ms=0):
         self._tried.append((provider.name, outcome, error))
-        costs.record(self.job, tier, provider.name, provider.model,
+        costs.record(self.job, tier, provider.name, provider.billed_as,
                      outcome=outcome, error=error, latency_ms=ms,
                      conn=self.conn)
         if self.log:

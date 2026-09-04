@@ -407,3 +407,98 @@ class TestAuditRedaction(unittest.TestCase):
                           "http.client"):
             self.assertNotIn(forbidden, src)
         self.assertIn("mode=ro", src)   # sqlite opened read-only
+
+
+class TestPathingCannotBeOverridden(unittest.TestCase):
+    """Regression: the /opt/spine bug, which shipped TWICE.
+
+    First in bin/run.sh — fixed by re-asserting after sourcing .env. Then
+    again in Python, where core.costs still read SPINE_ROOT and put the
+    database at /opt/spine/var/spine.db. bin/smoke-live sources .env too, so
+    the stale value came straight back and the live call died with
+    Permission denied.
+
+    The fix is not another re-assertion. It is that Python no longer reads
+    SPINE_ROOT at all: where the checkout lives is a fact the code can see,
+    and configuration must not be able to contradict it.
+    """
+
+    def setUp(self):
+        self._old = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._old)
+
+    def test_env_cannot_move_the_repository_root(self):
+        from core import paths
+        os.environ["SPINE_ROOT"] = "/opt/spine"
+        self.assertEqual(paths.root(), ROOT)
+
+    def test_env_cannot_move_the_database_into_a_root_owned_path(self):
+        from core import costs, paths
+        os.environ["SPINE_ROOT"] = "/opt/spine"
+        os.environ.pop("SPINE_DB", None)
+        for fn in (paths.db_path, costs.db_path):
+            self.assertTrue(fn().startswith(ROOT), f"{fn.__name__} -> {fn()}")
+            self.assertNotIn("/opt/spine", fn())
+
+    def test_spine_db_may_still_relocate_the_database(self):
+        """Putting the DB on another disk IS a real decision. Only the
+        checkout location is non-negotiable."""
+        from core import paths
+        os.environ["SPINE_DB"] = "/tmp/elsewhere.db"
+        self.assertEqual(paths.db_path(), "/tmp/elsewhere.db")
+
+    def test_registry_and_console_agree_with_paths(self):
+        from core import registry
+        os.environ["SPINE_ROOT"] = "/opt/spine"
+        self.assertEqual(registry.root(), ROOT)
+        with open(os.path.join(ROOT, "bin", "darkweb")) as fh:
+            src = fh.read()
+        self.assertNotIn('environ.get("SPINE_ROOT")', src)
+
+    def test_no_module_reads_SPINE_ROOT_anymore(self):
+        """The grep that keeps this from coming back a third time."""
+        import glob
+        offenders = []
+        for path in glob.glob(os.path.join(ROOT, "core", "*.py")):
+            with open(path) as fh:
+                if "SPINE_ROOT" in fh.read():
+                    offenders.append(os.path.basename(path))
+        self.assertEqual(
+            [o for o in offenders if o != "paths.py"], [],
+            f"these still read SPINE_ROOT: {offenders}")
+
+
+class TestGeminiAdapter(DbCase):
+
+    def test_uses_the_model_string_that_actually_resolves(self):
+        """gemini-2.5-flash-lite 404'd against Nick's AI Studio key."""
+        self.assertEqual(GeminiProvider().model, "gemini-3.5-flash-lite")
+
+    def test_free_tier_is_billed_at_zero_not_at_list_price(self):
+        """Billing a free call at the paid rate inflates month-to-date with
+        dollars nobody was charged, and the cap refuses on that number — so
+        an overstating table eventually blocks calls that cost nothing."""
+        p = GeminiProvider()
+        self.assertEqual(p.billed_as, "gemini-free-tier")
+        self.assertEqual(costs.price(p.billed_as, 1_000_000, 1_000_000), 0.0)
+
+    def test_a_paid_gemini_key_bills_at_the_real_rate(self):
+        p = GeminiProvider(free=False)
+        self.assertEqual(p.billed_as, "gemini-3.5-flash-lite")
+        self.assertGreater(costs.price(p.billed_as, 1_000_000, 0), 0.0)
+
+    def test_free_tier_calls_never_trip_the_cap(self):
+        os.environ["SPINE_MONTHLY_USD_CAP"] = "0.01"
+        p = GeminiProvider()
+        r = Router(tiers={"bulk": [p]}, job="t", data="public")
+        r.check_budget(p.billed_as, "x" * 100_000)   # must not raise
+
+    def test_the_key_never_goes_in_the_query_string(self):
+        """A URL with a key in it lands in logs, proxies and history."""
+        with open(os.path.join(ROOT, "core", "models.py")) as fh:
+            src = fh.read()
+        self.assertIn("x-goog-api-key", src)
+        self.assertNotIn("?key=", src)

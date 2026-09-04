@@ -175,9 +175,12 @@ def read_disk(path="/"):
 
 
 def spine_root():
-    return os.environ.get("SPINE_ROOT") or os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))
-    )
+    """Derived from this script's own path, never from SPINE_ROOT.
+
+    A stale SPINE_ROOT in someone's .env is a leftover, not a decision. See
+    core/paths.py for the two times that cost us an outage.
+    """
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def env_status():

@@ -17,6 +17,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 70
 
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
+# `set -a; . .env` exports whatever is in there, including a stale
+# SPINE_ROOT=/opt/spine left over from an old template. Python now ignores
+# it (core/paths.py), but unset it anyway so nothing downstream inherits a
+# path that does not exist.
+unset SPINE_ROOT
 
 if [ -z "${GEMINI_API_KEY:-}" ]; then
   echo "GEMINI_API_KEY is not set in .env — nothing to test against." >&2
