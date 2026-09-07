@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""
+bin/compare-migration — does the bridge actually see what darkweb-jobs has?
+
+This is the verification gate for Phase 2b, and the reason darkweb-jobs is
+not retired yet. Every test in tests/test_phase2b.py runs against synthetic
+databases built from the real schemas. That proves the code is
+self-consistent. It does not prove the code is right about the world.
+
+For each bridged collector it runs the source-side query, runs the
+item-store query, and reports what the source has that the store does not.
+
+    bin/compare-migration              all three sources
+    bin/compare-migration --source acris
+    bin/compare-migration --preview    what WOULD be emitted, no writes
+    bin/compare-migration --verbose    list the missing keys
+
+## Reading the output
+
+**Recent misses are a defect.** If something recorded in the last day or two
+is in the source and not in the store, the bridge is not keeping up: wrong
+threshold, wrong lookback, wrong join, or the collector is not running.
+
+**Old misses are expected.** Anything predating the collector's first run
+was never offered to the store, because each collector only looks back a
+fixed window. That is by design — see the note in core.bridge about the
+3,022-jump flood — and it is not a bug to chase.
+
+**Zero rows on both sides is not a pass.** It means the source is empty for
+that window, which tells you nothing about the bridge. The line says so
+rather than printing a reassuring green number.
+
+## The threshold question
+
+`--preview` exists because `SPINE_PROPTECH_MIN_AMOUNT` is a guess. It shows
+how many documents each threshold would surface per day, which is what sizes
+Phase 3's item cap. Run it before deciding.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+from core import bridge                                    # noqa: E402
+from core.store import Store                               # noqa: E402
+from collectors import acris, eventbot, polymarket         # noqa: E402
+
+# Each entry: how to read the source, and how to name what it produces so
+# the key can be compared against the store.
+SOURCES = {
+    "acris": {
+        "db": "proptech",
+        "module": acris,
+        "hours": acris.LOOKBACK_HOURS,
+    },
+    "polymarket": {
+        "db": "prediction",
+        "module": polymarket,
+        "hours": polymarket.LOOKBACK_HOURS,
+    },
+    "eventbot": {
+        "db": "eventbot",
+        "module": eventbot,
+        "hours": eventbot.LOOKBACK_HOURS,
+    },
+}
+
+
+def source_items(name: str, spec: dict) -> list[dict]:
+    """Run the collector's own query and item builder, without a Ctx.
+
+    Calling the same `select()` and `build_items()` the collector uses is
+    deliberate: a comparison tool with its own second implementation of the
+    query would drift, and then it would be verifying itself rather than the
+    collector.
+    """
+    mod = spec["module"]
+    since = bridge.since_iso(spec["hours"])
+    conn = bridge.connect(spec["db"])
+    try:
+        if name == "acris":
+            min_amount = bridge.env_int("SPINE_PROPTECH_MIN_AMOUNT",
+                                        mod.DEFAULT_MIN_AMOUNT)
+            rows = mod.select(conn, since, min_amount)
+        elif name == "polymarket":
+            min_volume = bridge.env_int("SPINE_POLYMARKET_MIN_VOLUME",
+                                        mod.DEFAULT_MIN_VOLUME)
+            rows = mod.select(conn, since, min_volume)
+        else:
+            rows = mod.select(conn, since)
+    finally:
+        conn.close()
+    return mod.build_items(rows)
+
+
+def stored_keys(store: Store, source: str) -> set[str]:
+    return {r["key"] for r in store.conn.execute(
+        "SELECT key FROM items WHERE source=?", (source,))}
+
+
+def compare(name: str, spec: dict, store: Store, verbose: bool) -> int:
+    """Returns the number of missing keys. 0 is good; -1 means unavailable."""
+    try:
+        items = source_items(name, spec)
+    except bridge.BridgeUnavailable as exc:
+        print(f"  {name:<12} UNAVAILABLE — {exc}")
+        return -1
+
+    have = stored_keys(store, name)
+    missing = [i for i in items if i["key"] not in have]
+
+    if not items:
+        print(f"  {name:<12} source is empty for the last "
+              f"{spec['hours']}h — this verifies nothing, come back when "
+              "the window has data")
+        return 0
+
+    pct = 100 * (len(items) - len(missing)) // len(items)
+    verdict = "ok" if not missing else "MISSING"
+    print(f"  {name:<12} source {len(items):>4}  stored {len(have):>4}  "
+          f"missing {len(missing):>4}  ({pct}% covered)  {verdict}")
+
+    if missing and verbose:
+        for i in missing[:20]:
+            print(f"      - {i['key'][:60]}  {i['title'][:60]}")
+        if len(missing) > 20:
+            print(f"      ... and {len(missing) - 20} more")
+
+    return len(missing)
+
+
+def preview() -> int:
+    """What each collector would emit right now, and what the ACRIS
+    threshold is actually costing. No writes."""
+    print("PREVIEW — what the collectors would emit now. Nothing is written.\n")
+
+    for name, spec in SOURCES.items():
+        try:
+            items = source_items(name, spec)
+        except bridge.BridgeUnavailable as exc:
+            print(f"{name}: unavailable — {exc}\n")
+            continue
+        per_day = len(items) * 24 / spec["hours"]
+        print(f"{name}: {len(items)} item(s) over {spec['hours']}h "
+              f"(~{per_day:.0f}/day)")
+        for i in sorted(items, key=lambda x: -x["importance"])[:5]:
+            print(f"    [{i['importance']:>3}] {i['title'][:70]}")
+        print()
+
+    # The threshold sweep. This is the number that sizes Phase 3's cap.
+    try:
+        conn = bridge.connect("proptech")
+    except bridge.BridgeUnavailable as exc:
+        print(f"threshold sweep skipped — {exc}")
+        return 0
+    try:
+        since = bridge.since_iso(24 * 30)
+        print("ACRIS documents in the last 30 days by threshold:")
+        print(f"  {'threshold':>12}  {'docs':>6}  {'per day':>8}")
+        for t in (0, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000):
+            rows = acris.select(conn, since, t, limit=100_000)
+            n = len({r["document_id"] for r in rows})
+            print(f"  {'$' + format(t, ','):>12}  {n:>6}  {n / 30:>8.1f}")
+        print("\n  Set SPINE_PROPTECH_MIN_AMOUNT so 'per day' is a number "
+              "you would actually read.")
+    finally:
+        conn.close()
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="compare-migration")
+    ap.add_argument("--source", choices=sorted(SOURCES))
+    ap.add_argument("--preview", action="store_true",
+                    help="what would be emitted, plus a threshold sweep")
+    ap.add_argument("--verbose", action="store_true",
+                    help="list the missing keys")
+    args = ap.parse_args(argv)
+
+    if args.preview:
+        return preview()
+
+    names = [args.source] if args.source else list(SOURCES)
+    print(f"comparing darkweb-jobs against the item store "
+          f"({bridge.dwj_root()})\n")
+
+    store = Store()
+    worst = 0
+    try:
+        for name in names:
+            n = compare(name, SOURCES[name], store, args.verbose)
+            worst = max(worst, n)
+    finally:
+        store.close()
+
+    print("\nrecent misses mean the bridge is not keeping up.")
+    print("old misses predate the collector's first run and are expected.")
+    print("run this daily for a week before trusting the brief.")
+    return 1 if worst > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
