@@ -213,42 +213,106 @@ class TestSharedDatabase(StoreCase):
 
 
 class TestCollectorIntegration(unittest.TestCase):
+    """The end-to-end proof: registry -> runner -> ctx.db -> items.
+
+    This used to run against `heartbeat`, which was the only collector that
+    existed. As of Phase 2b heartbeat deliberately writes no items (see its
+    docstring — 97 telemetry rows were 100% of the store), so the chain is
+    now proved with `acris` against a synthetic proptech.db instead.
+
+    Re-pointed rather than deleted: the thing under test is the framework
+    plumbing, not the collector. Losing the coverage because its subject
+    changed would be the wrong trade.
+    """
 
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
         self._old = dict(os.environ)
         os.environ["SPINE_DB"] = os.path.join(self._dir.name, "spine.db")
 
+        data = os.path.join(self._dir.name, "dwj", "data")
+        os.makedirs(data)
+        os.environ["SPINE_DWJ_ROOT"] = os.path.dirname(data)
+
+        import sqlite3
+        from datetime import datetime, timedelta, timezone
+        recorded = (datetime.now(timezone.utc) - timedelta(hours=2)
+                    ).strftime("%Y-%m-%dT%H:%M:%S")
+        conn = sqlite3.connect(os.path.join(data, "proptech.db"))
+        conn.executescript("""
+            CREATE TABLE acris_legals (
+              document_id TEXT, borough TEXT, block INTEGER, lot INTEGER,
+              bbl TEXT, street_number TEXT, street_name TEXT, unit TEXT,
+              property_type TEXT,
+              PRIMARY KEY (document_id, bbl, unit));
+            CREATE TABLE acris_master (
+              document_id TEXT PRIMARY KEY, doc_type TEXT, document_date TEXT,
+              recorded_datetime TEXT, document_amt REAL, percent_trans REAL,
+              fetched_ts TEXT);
+            CREATE TABLE pluto (
+              bbl TEXT PRIMARY KEY, borough TEXT, address TEXT, zipcode TEXT,
+              zonedist1 TEXT, bldgclass TEXT, landuse TEXT, unitsres INTEGER,
+              unitstotal INTEGER, yearbuilt INTEGER, numfloors REAL,
+              bldgarea REAL, lotarea REAL, assessland REAL, assesstot REAL,
+              ownername TEXT, latitude REAL, longitude REAL, fetched_ts TEXT);
+        """)
+        conn.execute("INSERT INTO acris_master VALUES (?,?,?,?,?,?,?)",
+                     ("2026000999001", "DEED", "2026-09-01", recorded,
+                      7_500_000.0, 100.0, recorded))
+        conn.execute("INSERT INTO acris_legals VALUES (?,?,?,?,?,?,?,?,?)",
+                     ("2026000999001", "1", 560, 42, "1005600042", "1",
+                      "TEST STREET", "", "CONDO"))
+        conn.commit()
+        conn.close()
+
     def tearDown(self):
         os.environ.clear()
         os.environ.update(self._old)
         self._dir.cleanup()
 
-    def test_heartbeat_writes_a_real_item_through_the_runner(self):
-        """The end-to-end proof: registry -> runner -> ctx.db -> items."""
+    def test_a_collector_writes_a_real_item_through_the_runner(self):
+        """registry -> runner -> ctx.db -> items, with a real collector."""
         from core import registry, runner
         jobs, errors = registry.discover()
         self.assertEqual(errors, [])
+        job = next(j for j in jobs if j.id == "acris")
+
+        code, state = runner.run_job(job, log=lambda *a, **k: None)
+        self.assertEqual(code, runner.EXIT_OK, state.get("error"))
+
+        s = Store()
+        rows = s.query(source="acris")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "deal")
+        self.assertEqual(rows[0]["status"], "new")
+        s.close()
+
+    def test_rerunning_a_collector_does_not_duplicate(self):
+        from core import registry, runner
+        jobs, _ = registry.discover()
+        job = next(j for j in jobs if j.id == "acris")
+        for _ in range(3):
+            runner.run_job(job, log=lambda *a, **k: None)
+        s = Store()
+        self.assertEqual(len(s.query(source="acris")), 1)
+        s.close()
+
+    def test_heartbeat_runs_green_and_writes_no_items(self):
+        """Phase 2b: telemetry left the store, but the chain must still run.
+
+        A collector returning zero items is a healthy outcome, not a
+        failure — the runner has to treat it that way or every quiet
+        morning looks like a broken box.
+        """
+        from core import registry, runner
+        jobs, _ = registry.discover()
         hb = next(j for j in jobs if j.id == "heartbeat")
 
         code, state = runner.run_job(hb, log=lambda *a, **k: None)
         self.assertEqual(code, runner.EXIT_OK, state.get("error"))
 
         s = Store()
-        rows = s.query(source="heartbeat")
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["kind"], "fact")
-        self.assertEqual(rows[0]["status"], "new")
-        s.close()
-
-    def test_rerunning_heartbeat_does_not_duplicate(self):
-        from core import registry, runner
-        jobs, _ = registry.discover()
-        hb = next(j for j in jobs if j.id == "heartbeat")
-        for _ in range(3):
-            runner.run_job(hb, log=lambda *a, **k: None)
-        s = Store()
-        self.assertEqual(len(s.query(source="heartbeat")), 1)
+        self.assertEqual(s.query(source="heartbeat"), [])
         s.close()
 
 

@@ -130,10 +130,20 @@ does, what it costs in RAM, and why stdlib can't. `httpx`/`requests` and
 
 - Every phase ends in a commit that leaves a **working system**.
 - **Nothing is deleted until its replacement is verified against real output.**
-- `darkweb-jobs` and its crontab are **not touched** by this repo until its
-  three collectors are reimplemented here and verified. Nick chose to retire
-  it; the retirement happens as one deliberate commit at Phase 2, not as a
-  side effect of scaffolding.
+- `darkweb-jobs` and its crontab are **not touched** by this repo.
+
+  *Revised Sept 7 2026.* The original plan reimplemented its three
+  collectors here and then retired it. Phase 2b instead reads its SQLite
+  files read-only (`core.bridge`), because rewriting three working
+  Socrata/Gamma clients against APIs this code has never called, then
+  trusting them on the first unattended 06:00 run, is the opposite of
+  "nothing is deleted until its replacement is verified against real
+  output."
+
+  **Consequence: darkweb-jobs is the permanent fetch layer and Spine the
+  item layer on top.** That is a real architectural change from the Sept 3
+  plan, not a delay. Revisit only after `bin/compare-migration` runs clean
+  for a week — at which point retirement is a decision made with data.
 - **Hermes is not touched.** It runs Telegram, it works, and rebuilding a
   message gateway is not on the critical path. Spine talks *to* it via
   `notify`.
@@ -161,6 +171,14 @@ One table. Every collector writes into it; the assistant reads across it.
           kind:   signal | deal | task | alert | fact
           status: new | seen | acted | dismissed
           UNIQUE(source, key)
+
+**An item is something Nick might act on.** Not everything a collector
+knows belongs here. `heartbeat` wrote one row every 30 minutes through all
+of Phase 2a; by the time Phase 3 was scoped those 97 telemetry rows were
+100% of the store, and a brief selecting the top 25 unacted items would
+have been 25 heartbeats. Infrastructure telemetry goes to a state file and
+surfaces in the console. If a collector's output would never be acted on,
+it is not an item.
 
 **`UNIQUE(source, key)` is what lets collectors be dumb.** They emit
 everything they see on every run; the store decides what is actually new.
@@ -208,7 +226,7 @@ that stops silo #11.
 | **0** | Job contract · registry generates crontab · `run.sh` + flock · windows + RAM guard | ✅ complete |
 | **1** | Model router (tiers, not model names) · cost accounting · `bin/status` | ✅ complete |
 | **2a** | Item store (`items`), `ctx.db`, `bin/items`, heartbeat migrated | ✅ complete |
-| **2b** | Reimplement acris/polymarket/eventbot · retire darkweb-jobs | **BLOCKED — need the darkweb-jobs source** |
+| **2b** | Read-only bridge to acris/polymarket/eventbot · `bin/compare-migration` · heartbeat off the store | ✅ built; **burn-in required before Phase 3** |
 | **3** | **Proptech collector** (ACRIS/PLUTO depth) | *order changed by Nick, Sept 3* |
 | **4** | Assistant v1 — daily brief → Telegram | |
 | **5** | Email + calendar collectors, read-only | |
@@ -216,6 +234,14 @@ that stops silo #11.
 
 **Stop and ask for code review when a phase is complete.** Do not roll into
 the next phase unprompted.
+
+**Phase 2b is not complete when the tests pass.** Every test in
+`tests/test_phase2b.py` runs against synthetic databases built from dumped
+schemas — that proves the code is self-consistent, not that it is right
+about the world. `bin/compare-migration` is the gate, and it needs a week of
+real output. It also answers the one number Phase 3 cannot guess:
+`SPINE_PROPTECH_MIN_AMOUNT` is a placeholder, and `--preview` shows what
+each threshold costs per day.
 
 ---
 
