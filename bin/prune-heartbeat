@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""
+bin/prune-heartbeat — remove the telemetry rows heartbeat wrote in Phase 2a.
+
+A one-off. Once it has run and `collectors/heartbeat.py` no longer writes
+items, nothing will recreate these rows and this script can be deleted.
+
+## Why the normal pruner will not do this
+
+`core.store.RETENTION_DAYS` maps `fact` to 0, meaning keep forever — a
+recorded deed is a permanent fact about a building, and that is the right
+default for the kind. Heartbeat rows are also `fact`, so `--prune` correctly
+refuses to touch them. The rows are wrong because they should never have
+been items at all, not because they aged out. That calls for a deliberate
+one-time deletion, not a change to the retention policy.
+
+## Why it defaults to dry-run
+
+This is the only script in the repo that deletes rows Nick did not ask to
+expire. CLAUDE.md section 6: nothing is deleted until its replacement is
+verified. So it prints what it would do and stops, and the deletion needs
+`--yes` typed on purpose.
+
+Anything `acted` is never touched, matching `Store.prune`. If Nick marked a
+heartbeat acted, that was a decision and the record of it stays.
+
+    bin/prune-heartbeat           what it would delete
+    bin/prune-heartbeat --yes     delete it
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+from core.store import Store                               # noqa: E402
+
+SOURCE = "heartbeat"
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="prune-heartbeat")
+    ap.add_argument("--yes", action="store_true",
+                    help="actually delete (default is a dry run)")
+    args = ap.parse_args(argv)
+
+    s = Store()
+    try:
+        rows = s.conn.execute(
+            "SELECT status, COUNT(*) n, MIN(ts) first, MAX(ts) last "
+            "FROM items WHERE source=? GROUP BY status", (SOURCE,)).fetchall()
+
+        if not rows:
+            print("no heartbeat items in the store — nothing to do")
+            return 0
+
+        total = sum(r["n"] for r in rows)
+        keep = sum(r["n"] for r in rows if r["status"] == "acted")
+        drop = total - keep
+
+        print(f"heartbeat items in the store: {total}")
+        for r in rows:
+            print(f"  {r['status']:<10} {r['n']:>5}   "
+                  f"{r['first'][:16]} .. {r['last'][:16]}")
+        if keep:
+            print(f"\n{keep} acted item(s) will be KEPT — acted rows are the "
+                  "record of what you actually did")
+
+        if not args.yes:
+            print(f"\nwould delete {drop} row(s). Re-run with --yes to do it.")
+            return 0
+
+        with s.conn:
+            cur = s.conn.execute(
+                "DELETE FROM items WHERE source=? AND status != 'acted'",
+                (SOURCE,))
+        print(f"\ndeleted {cur.rowcount} row(s).")
+        print("collectors/heartbeat.py no longer writes items, so these "
+              "will not come back. This script can be deleted.")
+        return 0
+    finally:
+        s.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
