@@ -284,5 +284,120 @@ class TestDelivery(unittest.TestCase):
                                  "core.notify references " + banned + " in code")
 
 
+class _Job:
+    id = "brief"
+    tier = "smart"
+
+
+class _Models:
+    """Stands in for ctx.models. Either raises or returns a canned completion."""
+
+    def __init__(self, exc=None, text="a paragraph"):
+        self._exc = exc
+        self._text = text
+        self.calls = 0
+
+    def complete(self, prompt, tier=None, max_tokens=None):
+        self.calls += 1
+        if self._exc:
+            raise self._exc
+        from core.models import Completion
+        return Completion(text=self._text, tokens_in=10, tokens_out=5,
+                          provider="fake", model="fake", latency_ms=1, usd=0.0)
+
+
+class _Notify:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, text):
+        self.sent.append(text)
+        return True
+
+
+class _Ctx:
+    def __init__(self, models=None, dry_run=False):
+        from datetime import datetime, timezone
+        self.job = _Job()
+        self.models = models or _Models()
+        self.notify = _Notify()
+        self.dry_run = dry_run
+        self.now = datetime(2026, 9, 30, 11, 0, tzinfo=timezone.utc)
+        self.logs = []
+
+    def log(self, msg, **kw):
+        self.logs.append((msg, kw))
+
+
+class TestBriefJobDegrades(unittest.TestCase):
+    """The brief must survive every way the model can fail."""
+
+    DIGEST = "spine brief - test\n1 item(s)\n\nDEALS\n  [ 60] a deed"
+
+    def _patch_build(self, rows=1):
+        """Keep the job away from the real store so these stay offline."""
+        from collectors import brief as job
+        rowlist = [{"key": "k", "kind": "deal", "source": "acris",
+                    "importance": 60, "title": "a deed", "ts": "2026-09-30T00:00:00Z"}]
+        original = job.brief_mod.build
+        job.brief_mod.build = lambda now=None: (self.DIGEST, rowlist[:rows])
+        self.addCleanup(setattr, job.brief_mod, "build", original)
+        return job
+
+    def test_a_model_refusal_does_not_stop_delivery(self):
+        """PrivacyRefusal, BudgetRefusal and NoProviders all land here. The
+        morning the gate refuses is a morning you still want the list."""
+        from core.models import PrivacyRefusal
+        job = self._patch_build()
+        ctx = _Ctx(models=_Models(exc=PrivacyRefusal("nope")))
+        out = job.run(ctx)
+        self.assertEqual(len(ctx.notify.sent), 1)
+        self.assertIn("a deed", ctx.notify.sent[0])
+        self.assertFalse(out["stats"]["judgment"])
+        self.assertTrue(out["stats"]["sent"])
+
+    def test_a_dead_daemon_does_not_stop_delivery(self):
+        job = self._patch_build()
+        ctx = _Ctx(models=_Models(exc=OSError("connection refused")))
+        job.run(ctx)
+        self.assertEqual(len(ctx.notify.sent), 1)
+
+    def test_an_empty_completion_is_treated_as_no_judgment(self):
+        """A model that answers with whitespace has told you nothing, and
+        appending a blank commentary block would only look broken."""
+        job = self._patch_build()
+        ctx = _Ctx(models=_Models(text="   "))
+        out = job.run(ctx)
+        self.assertFalse(out["stats"]["judgment"])
+        self.assertNotIn("machine read", ctx.notify.sent[0])
+
+    def test_judgment_is_appended_and_labelled_never_substituted(self):
+        """The deterministic list is the record. Commentary sits after it and
+        says what produced it, because a 4.7B model at Q4 is a second opinion."""
+        job = self._patch_build()
+        ctx = _Ctx(models=_Models(text="watch the Brooklyn mortgage"))
+        job.run(ctx)
+        sent = ctx.notify.sent[0]
+        self.assertIn("a deed", sent)
+        self.assertIn("machine read", sent)
+        self.assertLess(sent.index("a deed"), sent.index("machine read"))
+
+    def test_no_model_call_when_there_is_nothing_to_judge(self):
+        """An empty queue does not need 40 seconds of inference to confirm it."""
+        job = self._patch_build(rows=0)
+        models = _Models()
+        ctx = _Ctx(models=models)
+        job.run(ctx)
+        self.assertEqual(models.calls, 0)
+        self.assertEqual(len(ctx.notify.sent), 1)
+
+    def test_dry_run_sends_nothing(self):
+        job = self._patch_build()
+        ctx = _Ctx(dry_run=True)
+        out = job.run(ctx)
+        self.assertEqual(ctx.notify.sent, [])
+        self.assertFalse(out["stats"]["sent"])
+
+
 if __name__ == "__main__":
     unittest.main()
