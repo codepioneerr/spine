@@ -49,10 +49,23 @@ from core import bridge
 
 META = {
     "id": "eventbot",
-    # 06:20 UTC, ahead of acris at 06:30. eventbot's tick runs every five
-    # minutes so there is no quiet moment to aim for; the read is read-only
-    # and takes milliseconds against 18 rows.
-    "schedule": "20 6 * * *",
+    # Hourly at :20, changed from daily 06:20 on 2026-09-30.
+    #
+    # A daily snapshot of "currently open positions" is stale by construction.
+    # eventbot opened positions 195, 196 and 197 at 18:00, 19:05 and 20:10 on
+    # the day this changed, and bin/compare-migration reported the store 1 of 23
+    # short within fifteen minutes of a successful run. That is not the bridge
+    # failing to keep up in the sense the burn-in gate is watching for -- it is
+    # the schedule being wrong for data that changes hourly, and left as it was
+    # the gate could never pass for this source.
+    #
+    # Hourly is affordable because the read is genuinely trivial: light/any,
+    # 80 MB declared, milliseconds against ~23 rows, read-only. :20 stays clear
+    # of everything else on the box -- darkweb-jobs ticks on */5 and snapshots
+    # on :00/:30, spine heartbeats at :07/:37 and reads polymarket at :12/:42.
+    # It also lands 20 minutes before the 09:40 brief, so the positions it
+    # reports are at most that old.
+    "schedule": "20 * * * *",
     "timeout": 120,
     "ram_mb": 80,
     "window": "any",
