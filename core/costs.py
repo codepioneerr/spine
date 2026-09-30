@@ -72,6 +72,11 @@ PRICING: dict[str, tuple[float, float]] = {
     # matters even when "how many dollars" is zero.
     "mock":                  (0.00, 0.00),
     "nvidia-nim-free":       (0.00, 0.00),
+    # Runs on this box. Free in dollars and non-logging by construction,
+    # but the row still gets written: latency and outcome are the columns
+    # that matter for a local model, and a model that silently stopped
+    # answering is only visible if the zero-dollar calls are recorded too.
+    "qwen3.5-4b-local":      (0.00, 0.00),
     # The Google AI Studio FREE tier costs nothing. Pricing it at the paid
     # list rate would inflate month-to-date with dollars that were never
     # charged, and the cap — which refuses on that number — would eventually

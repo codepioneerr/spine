@@ -198,13 +198,37 @@ class TestPrivacyGate(DbCase):
         self.assertTrue(GeminiProvider().logs_prompts)
         self.assertTrue(GeminiProvider().free)
 
-    def test_smart_tier_is_empty_and_says_so_clearly(self):
-        """Phase 1 ships with no non-logging paid endpoint. A private job
-        asking for `smart` must get a clear error, not a surprise."""
+    def test_frontier_tier_is_empty_and_says_so_clearly(self):
+        """There is still no paid non-logging endpoint. A private job asking
+        for `frontier` must get a clear error, not a surprise.
+
+        This assertion used to be made against `smart`. Track B (2026-09-30)
+        put a local Ollama model in that tier, so the invariant moved here
+        rather than being deleted -- an empty tier still has to say so."""
         r = self.router(models.default_tiers(), data="private")
         with self.assertRaises(NoProviders) as e:
-            r.complete("judgment needed", tier="smart")
+            r.complete("judgment needed", tier="frontier")
         self.assertIn("no providers configured", str(e.exception))
+
+    def test_smart_tier_serves_private_data_because_it_is_local(self):
+        """The one case the gate must now ALLOW -- and for the right reason.
+
+        A private job may use `smart` only because the provider there runs on
+        this box and therefore declares logs_prompts=False. If someone later
+        swaps in a hosted provider without flipping that flag honestly, this
+        test keeps passing and the leak is silent -- so assert the flag and
+        the eligibility together.
+
+        Deliberately does NOT call complete(). That would run a real 3.4 GB
+        inference from the test suite, which is how this test failed when the
+        tier was first populated."""
+        r = self.router(models.default_tiers(), data="private")
+        eligible = r.eligible("smart")
+        self.assertEqual(len(eligible), 1)
+        p = eligible[0]
+        self.assertFalse(p.logs_prompts, "smart provider must be non-logging")
+        self.assertTrue(p.free, "a local model costs no dollars")
+        self.assertIsNone(p.key_env, "a localhost socket needs no key")
 
     def test_default_bulk_tier_refuses_private_data(self):
         """As shipped: bulk is Gemini free, which logs. A private job routed

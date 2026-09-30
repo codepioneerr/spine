@@ -208,6 +208,123 @@ class GeminiProvider(Provider):
                 int(usage.get("candidatesTokenCount", len(text) // 4)))
 
 
+class OllamaProvider(Provider):
+    """A model on this box, served by Ollama over localhost.
+
+    The first provider where `logs_prompts=False` is literally true rather
+    than a promise someone else made: the prompt never leaves the machine, so
+    there is no retention policy to trust. That is the whole reason `smart`
+    can serve private jobs while the Anthropic balance is zero.
+
+    Three things here are deliberate.
+
+    **`think` is off.** qwen3.5 advertises a thinking mode. On a 1.8 GHz
+    mobile i7 with no GPU, thinking tokens are the difference between a brief
+    and a timeout, and a morning digest does not need a visible chain of
+    thought.
+
+    **`keep_alive` is short.** Ollama keeps a model resident after a call and
+    this one is 3.4 GB on an 8 GB box. For one brief a day, paying the reload
+    cost beats holding 40% of RAM for the other 23 hours.
+
+    **`available()` probes the socket.** The base implementation short-circuits
+    to True whenever `key_env` is None, which for a network service would mean
+    a dead daemon looks like a healthy provider and surfaces as a hard failure
+    mid-call instead of a skip the router can fall through.
+
+    One caveat that belongs in the caller, not here: Ollama runs as a
+    different user and the 3.4 GB is allocated in a process
+    `core.governor.available_mb()` cannot see or attribute. The RAM guard is
+    only honest if the job that wakes this model declares `ram_mb` for it.
+
+    Measured on the Dell, 2026-09-30, qwen3.5:4b at Q4_K_M, num_ctx=4096:
+
+        ollama /api/ps size     2989 MB   (size_vram 0 -- pure CPU)
+        MemAvailable delta      3667 MB   what the guard actually sees
+        available while loaded  2987 MB
+        swap                    10 -> 16 MB, i.e. it did not swap
+        throughput              2.8 tok/s (56 s for 159 output tokens)
+
+    The calling job should declare ram_mb: 3500, which is HARD_MAX_MB in
+    core.job. That understates the observed 3667 by about 270 MB, but a
+    heavy job also gets the full 1024 MB headroom added, so the guard still
+    holds roughly 750 MB of real margin and refuses admission below about
+    4.4 GB available. Raising HARD_MAX_MB to fit 3667 exactly would trade a
+    documented understatement for a weaker ceiling; the measurement above is
+    the honest record either way.
+
+    2.8 tok/s is the real constraint on what this tier can be asked to do.
+    One brief a day is comfortable. Anything conversational is not.
+    """
+
+    DEFAULT_HOST = "http://127.0.0.1:11434"
+
+    def __init__(self, model="qwen3.5:4b", name="ollama_local",
+                 host=None, keep_alive="30s", num_ctx=4096):
+        super().__init__(name=name, model=model, free=True,
+                         logs_prompts=False,   # local: nothing leaves the box
+                         key_env=None,         # a localhost socket needs no key
+                         price_model="qwen3.5-4b-local")
+        self.host = (host or os.environ.get("SPINE_OLLAMA_HOST")
+                     or self.DEFAULT_HOST).rstrip("/")
+        self.keep_alive = keep_alive
+        # Pinned, and the single most important number in this class. qwen3.5
+        # advertises a 262k context window; left unset, Ollama sizes its KV
+        # cache from the model default and the process measured 3.74 GB on
+        # 2026-09-30 -- past core.job.HARD_MAX_MB (3500), so no job could
+        # honestly declare it. A brief prompt is ~700 tokens. 4096 is generous
+        # for that and keeps the footprint inside the night-window budget.
+        self.num_ctx = num_ctx
+
+    def available(self, secrets=None) -> tuple[bool, str]:
+        try:
+            req = urllib.request.Request(self.host + "/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                names = {m.get("model") for m in json.loads(r.read().decode()).get("models", [])}
+        except Exception as exc:
+            return False, f"ollama unreachable at {self.host}: {type(exc).__name__}"
+        if self.model not in names:
+            return False, f"ollama has no model {self.model!r} (pull it first)"
+        return True, f"ollama serving {self.model}"
+
+    def complete(self, prompt, *, max_tokens, timeout, secrets=None):
+        body = json.dumps({
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "think": False,
+            "keep_alive": self.keep_alive,
+            "options": {"num_predict": max_tokens, "num_ctx": self.num_ctx},
+        }).encode()
+
+        req = urllib.request.Request(
+            self.host + "/api/generate",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                payload = json.loads(r.read().decode())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")[:200]
+            raise ModelError(f"{self.name}: HTTP {exc.code} {detail}") from exc
+        except Exception as exc:
+            raise ModelError(f"{self.name}: {type(exc).__name__}: {exc}") from exc
+
+        text = payload.get("response")
+        if text is None:
+            raise ModelError(
+                f"{self.name}: unexpected response shape: "
+                f"{json.dumps(payload)[:200]}")
+
+        # Ollama reports real token counts; fall back to the same rough
+        # estimate the other providers use rather than recording a zero,
+        # because a zero here would understate usage in the costs table.
+        return (text,
+                int(payload.get("prompt_eval_count", len(prompt) // 4)),
+                int(payload.get("eval_count", max(1, len(text) // 4))))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # the router
 # ─────────────────────────────────────────────────────────────────────────────
@@ -346,7 +463,11 @@ def default_tiers() -> dict[str, list[Provider]]:
     """
     return {
         "bulk": [GeminiProvider()],
-        "smart": [],
+        # Local, so logs_prompts=False is a fact about the network rather than
+        # a vendor policy, which is what lets a private job use this tier at
+        # all. Added 2026-09-30. frontier stays empty on purpose: there is
+        # still no paid non-logging endpoint, and an empty tier says so.
+        "smart": [OllamaProvider()],
         "frontier": [],
     }
 
