@@ -88,8 +88,27 @@ def group(rows):
     return out
 
 
-def render(rows, *, total_unacted=None, now=None, title="spine brief"):
-    """Pure. The digest as plain text, safe to send as one Telegram message."""
+def _label(kind, n):
+    """The kind name, singular when there is one of it.
+
+    Every KIND_LABEL is a plain plural, so dropping the trailing s is correct
+    for all of them. It reads as detail rather than as a template someone
+    forgot to finish -- "1 signals" is the kind of thing that makes a daily
+    message feel unmaintained.
+    """
+    word = KIND_LABEL.get(kind, kind).lower()
+    return word[:-1] if n == 1 and word.endswith("s") else word
+
+
+def render(rows, *, total_unacted=None, suppressed=None, now=None,
+           title="spine brief"):
+    """Pure. The digest as plain text, safe to send as one Telegram message.
+
+    `suppressed` is an optional {kind: count} of what the cap left out. A bare
+    "+ 126 more" says something is hidden without saying what, which is exactly
+    the shape of a message people stop reading. Naming the kinds means a day
+    when deals crowd out every position is visible rather than silent.
+    """
     now = now or datetime.now(timezone.utc)
     shown = len(rows)
     stamp = now.strftime("%a %b %d %H:%M")
@@ -114,8 +133,16 @@ def render(rows, *, total_unacted=None, now=None, title="spine brief"):
             lines.append(f"{mark} [{imp:>3}] " + str(r["title"]))
 
     if total_unacted and total_unacted > shown:
+        rest = total_unacted - shown
+        detail = ""
+        if suppressed:
+            parts = [f"{n} {_label(k, n)}"
+                     for k, n in sorted(suppressed.items(),
+                                        key=lambda kv: -kv[1]) if n]
+            if parts:
+                detail = " (" + ", ".join(parts) + ")"
         lines.append("")
-        lines.append(f"+ {total_unacted - shown} more: bin/items --all")
+        lines.append(f"+ {rest} more{detail}: bin/items --all")
 
     lines.append("")
     lines.append("read-only. nothing here sent, bought, posted or deleted.")
@@ -123,13 +150,30 @@ def render(rows, *, total_unacted=None, now=None, title="spine brief"):
     return chr(10).join(lines)
 
 
+# Generous, because this bounds the accuracy of the suppressed-by-kind
+# breakdown rather than the size of the brief. The brief itself is capped at
+# MAX_ITEMS regardless.
+FETCH_LIMIT = 1000
+
+
 def build(st=None, limit=MAX_ITEMS, now=None):
     """Read the store and produce (text, rows). The only I/O in this module."""
     st = st or store.Store()
-    rows = select(st.unacted(limit=200), limit=limit)
+    fetched = st.unacted(limit=FETCH_LIMIT)
+    rows = select(fetched, limit=limit)
+
+    chosen = {r["key"] for r in rows}
+    suppressed = {}
+    for r in fetched:
+        if r["key"] in chosen or r["source"] in TELEMETRY_SOURCES:
+            continue
+        kind = r["kind"]
+        suppressed[kind] = suppressed.get(kind, 0) + 1
+
     counts = st.counts()
     total = sum(counts.get(k, 0) for k in ("new", "seen"))
-    return render(rows, total_unacted=total, now=now), rows
+    return (render(rows, total_unacted=total, suppressed=suppressed, now=now),
+            rows)
 
 
 def main(argv=None):

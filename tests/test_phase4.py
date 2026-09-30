@@ -399,5 +399,50 @@ class TestBriefJobDegrades(unittest.TestCase):
         self.assertFalse(out["stats"]["sent"])
 
 
+class TestSuppressedBreakdown(unittest.TestCase):
+    """The footer says what the cap left out, not just how much."""
+
+    NOW = datetime(2026, 9, 30, 11, 0, tzinfo=timezone.utc)
+
+    def _out(self, suppressed, total=200):
+        return brief.render([row("a")], total_unacted=total,
+                            suppressed=suppressed, now=self.NOW)
+
+    def test_kinds_are_named_and_ordered_by_count(self):
+        out = self._out({"signal": 1, "deal": 98, "fact": 24})
+        line = [l for l in out.split(chr(10)) if l.startswith("+ ")][0]
+        self.assertIn("98 deals", line)
+        self.assertIn("24 positions", line)
+        self.assertIn("1 signal", line)
+        self.assertLess(line.index("98 deals"), line.index("24 positions"))
+        self.assertLess(line.index("24 positions"), line.index("1 signal"))
+
+    def test_one_of_something_reads_singular(self):
+        """1 signals is the kind of thing that makes a daily message feel
+        unmaintained."""
+        out = self._out({"signal": 1})
+        self.assertIn("1 signal", out)
+        self.assertNotIn("1 signals", out)
+
+    def test_many_stays_plural(self):
+        out = self._out({"signal": 2})
+        self.assertIn("2 signals", out)
+
+    def test_a_zero_count_is_not_listed(self):
+        out = self._out({"deal": 5, "alert": 0})
+        self.assertIn("5 deals", out)
+        self.assertNotIn("alert", out.split("+ ")[-1])
+
+    def test_no_breakdown_still_gives_a_bare_count(self):
+        """render stays usable without the breakdown -- layer 2 and any future
+        caller may build rows by hand."""
+        out = brief.render([row("a")], total_unacted=50, now=self.NOW)
+        self.assertIn("+ 49 more:", out)
+
+    def test_an_unknown_kind_is_named_not_swallowed(self):
+        out = self._out({"invented": 3})
+        self.assertIn("3 invented", out)
+
+
 if __name__ == "__main__":
     unittest.main()
