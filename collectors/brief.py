@@ -31,7 +31,10 @@ UTC is 05:40 ET in summer and 04:40 in winter, both inside the 01:00-06:00
 window, and both early enough that the brief is waiting rather than arriving.
 """
 
+import io
+
 from core import brief as brief_mod
+from core import paths
 
 META = {
     "id": "brief",
@@ -88,6 +91,20 @@ def judgment(ctx, digest):
     return text
 
 
+def _keep(text):
+    """Write the brief where a human can find it, and return the path.
+
+    Deliberately one fixed file that is overwritten rather than a timestamped
+    series: this is a recovery copy for the current morning, not an archive,
+    and an unbounded pile of briefs on a 232 GB disk is a slow leak nobody
+    would notice. The item store is the durable record.
+    """
+    path = paths.var("state", "brief_last.txt")
+    with io.open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
 def run(ctx):
     text, rows = brief_mod.build(now=ctx.now)
     ctx.log("brief built", items=len(rows), chars=len(text))
@@ -105,7 +122,18 @@ def run(ctx):
         return {"items": [], "stats": {"items_in_brief": len(rows),
                                        "judgment": bool(note), "sent": False}}
 
-    ctx.notify.send(text)
-    ctx.log("brief sent", chars=len(text))
+    # Written before the send, not after. A brief that was generated and then
+    # failed to leave the box is still worth having -- the alternative is that
+    # a 401, a stopped gateway or a network blip silently costs you the whole
+    # morning and leaves nothing but an exit code.
+    kept = _keep(text)
+
+    try:
+        ctx.notify.send(text)
+    except Exception as exc:
+        ctx.log("DELIVERY FAILED", error=str(exc)[:200], preserved_at=kept)
+        raise
+
+    ctx.log("brief sent", chars=len(text), preserved_at=kept)
     return {"items": [], "stats": {"items_in_brief": len(rows),
                                    "judgment": bool(note), "sent": True}}

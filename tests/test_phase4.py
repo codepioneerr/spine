@@ -335,14 +335,55 @@ class TestBriefJobDegrades(unittest.TestCase):
     DIGEST = "spine brief - test\n1 item(s)\n\nDEALS\n  [ 60] a deed"
 
     def _patch_build(self, rows=1):
-        """Keep the job away from the real store so these stay offline."""
+        """Keep the job away from the real store and the real filesystem.
+
+        _keep is stubbed as well as build: it writes var/state/brief_last.txt,
+        and a test suite that overwrites the recovery copy of this morning
+        brief with the string "a deed" has broken the thing it was checking.
+        """
         from collectors import brief as job
         rowlist = [{"key": "k", "kind": "deal", "source": "acris",
                     "importance": 60, "title": "a deed", "ts": "2026-09-30T00:00:00Z"}]
-        original = job.brief_mod.build
+
+        original_build = job.brief_mod.build
         job.brief_mod.build = lambda now=None: (self.DIGEST, rowlist[:rows])
-        self.addCleanup(setattr, job.brief_mod, "build", original)
+        self.addCleanup(setattr, job.brief_mod, "build", original_build)
+
+        original_keep = job._keep
+        self.kept = []
+
+        def fake_keep(text):
+            self.kept.append(text)
+            return "/tmp/not-written-by-tests.txt"
+
+        job._keep = fake_keep
+        self.addCleanup(setattr, job, "_keep", original_keep)
         return job
+
+    def test_the_brief_is_preserved_before_it_is_sent(self):
+        """Order matters: generated-then-undelivered must still leave a copy."""
+        from core import notify
+        job = self._patch_build()
+        ctx = _Ctx()
+        ctx.notify.send = lambda text: (_ for _ in ()).throw(
+            notify.NotifyError("gateway down"))
+        with self.assertRaises(notify.NotifyError):
+            job.run(ctx)
+        self.assertEqual(len(self.kept), 1)
+        self.assertIn("a deed", self.kept[0])
+
+    def test_delivery_failure_is_logged_with_the_path(self):
+        from core import notify
+        job = self._patch_build()
+        ctx = _Ctx()
+        ctx.notify.send = lambda text: (_ for _ in ()).throw(
+            notify.NotifyError("gateway down"))
+        with self.assertRaises(notify.NotifyError):
+            job.run(ctx)
+        msgs = [m for m, kw in ctx.logs if "DELIVERY FAILED" in m]
+        self.assertEqual(len(msgs), 1)
+        kw = [kw for m, kw in ctx.logs if "DELIVERY FAILED" in m][0]
+        self.assertIn("preserved_at", kw)
 
     def test_a_model_refusal_does_not_stop_delivery(self):
         """PrivacyRefusal, BudgetRefusal and NoProviders all land here. The
