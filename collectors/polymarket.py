@@ -52,7 +52,7 @@ LOOKBACK_HOURS = 6
 # darkweb-jobs already filters at $20k when detecting jumps; this is a
 # second, higher bar for "worth Nick's attention" as opposed to "worth
 # recording".
-DEFAULT_MIN_VOLUME = 50_000
+DEFAULT_MIN_VOLUME = 250_000
 
 MAX_ROWS = 200
 
@@ -62,6 +62,7 @@ SELECT ts, market_id, question, prev_price, new_price, delta,
   FROM jumps
  WHERE ts >= ?
    AND volume24h >= ?
+   AND political = 1
  ORDER BY ABS(delta) DESC, ts DESC
  LIMIT ?
 """
