@@ -79,7 +79,7 @@ SELECT m.document_id, m.doc_type, m.document_date, m.recorded_datetime,
   FROM acris_master m
   LEFT JOIN acris_legals l ON l.document_id = m.document_id
   LEFT JOIN pluto       p ON p.bbl = l.bbl
- WHERE m.recorded_datetime >= ?
+ WHERE m.fetched_ts >= ?
    AND m.document_amt >= ?
    AND m.doc_type IN ({types})
  ORDER BY m.recorded_datetime DESC
