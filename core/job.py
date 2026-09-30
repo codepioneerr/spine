@@ -276,7 +276,7 @@ class Ctx:
         # Imported here rather than at module scope: core.models imports
         # core.costs which opens sqlite, and core.job must stay importable by
         # the registry without touching the database.
-        from core import http, models, store
+        from core import http, models, notify as notify_mod, store
         secrets = _Secrets(root)
         return cls(
             job=job, log=log, root=root,
@@ -285,7 +285,10 @@ class Ctx:
             db=store.Store(source=job.id),
             http=http.Http(timeout=30),
             models=models.for_job(job, secrets=secrets, log=log),
-            notify=_Pending("notify", "Phase 3 (Telegram)"),
+            # Graduated from _Pending 2026-09-30. Constructing this reads two
+            # values from .env and opens no socket, so a job that never calls
+            # send() costs nothing and the test suite stays offline.
+            notify=notify_mod.Notifier(secrets=secrets),
         )
 
 

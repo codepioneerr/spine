@@ -136,5 +136,153 @@ class TestNoModelCall(unittest.TestCase):
         self.assertNotIn("core.models", src)
 
 
+class _FakeResponse:
+    """Minimal stand-in for the urlopen context manager."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def read(self):
+        import json
+        return json.dumps(self._payload).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class TestDelivery(unittest.TestCase):
+    """core.notify. Offline: urlopen is replaced, nothing reaches hermes."""
+
+    URL = "http://127.0.0.1:8644/webhooks/spine-brief"
+    SECRET = "test-secret-not-the-real-one"
+
+    def _notifier(self, **kw):
+        from core import notify
+        return notify.Notifier(url=self.URL, secret=self.SECRET, **kw)
+
+    def _capture(self, payload=None):
+        """Patch urlopen, return (notifier, captured_requests)."""
+        from core import notify
+        captured = []
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(req)
+            return _FakeResponse(payload if payload is not None
+                                 else {"status": "delivered"})
+
+        self._orig = notify.urllib.request.urlopen
+        notify.urllib.request.urlopen = fake_urlopen
+        self.addCleanup(setattr, notify.urllib.request, "urlopen", self._orig)
+        return self._notifier(), captured
+
+    def test_unconfigured_raises_and_says_how_to_fix_it(self):
+        """A silent False is how darkweb-jobs delivered nothing for a month."""
+        from core import notify
+        n = notify.Notifier(url=None, secret=None)
+        self.assertFalse(n.configured())
+        with self.assertRaises(notify.NotifyError) as e:
+            n.send("anything")
+        msg = str(e.exception)
+        self.assertIn("SPINE_BRIEF_WEBHOOK_URL", msg)
+        self.assertIn("hermes webhook subscribe", msg)
+
+    def test_empty_message_is_not_an_error(self):
+        """Nothing to say is a normal outcome, not a failure."""
+        n = self._notifier()
+        self.assertFalse(n.send(""))
+        self.assertFalse(n.send("   \n  "))
+
+    def test_signature_is_hmac_over_timestamp_dot_body(self):
+        """The exact scheme hermes validates. If this drifts, delivery starts
+        returning 401 and the only symptom is a missing brief."""
+        import hashlib
+        import hmac
+
+        n, captured = self._capture()
+        self.assertTrue(n.send("hello"))
+        self.assertEqual(len(captured), 1)
+        req = captured[0]
+
+        stamp = req.get_header("X-webhook-timestamp")
+        sig = req.get_header("X-webhook-signature-v2")
+        self.assertTrue(stamp and sig)
+
+        expected = hmac.new(self.SECRET.encode(),
+                            stamp.encode() + b"." + req.data,
+                            hashlib.sha256).hexdigest()
+        self.assertEqual(sig, expected)
+
+    def test_the_deprecated_v1_signature_is_not_sent(self):
+        """hermes accepts a body-only V1 and warns that it is replay-
+        vulnerable. There is no reason to send the weaker one."""
+        n, captured = self._capture()
+        n.send("hello")
+        self.assertIsNone(captured[0].get_header("X-webhook-signature"))
+
+    def test_body_is_the_text_field_the_route_template_expects(self):
+        """The subscription renders {text}. A different key delivers nothing
+        while still returning 200."""
+        import json
+        n, captured = self._capture()
+        n.send("the brief")
+        self.assertEqual(json.loads(captured[0].data.decode()), {"text": "the brief"})
+
+    def test_over_long_text_is_truncated_not_rejected(self):
+        """Telegram hard-limits at 4096. A long brief should arrive short."""
+        import json
+        from core import notify
+        n, captured = self._capture()
+        n.send("x" * 9000)
+        sent = json.loads(captured[0].data.decode())["text"]
+        self.assertLess(len(sent), 4096)
+        self.assertIn("truncated", sent)
+
+    def test_a_200_that_did_not_deliver_still_raises(self):
+        """hermes can accept the post and fail to relay it. Accepting is not
+        delivering, and the caller needs to know the difference."""
+        from core import notify
+        n, _ = self._capture(payload={"status": "queued"})
+        with self.assertRaises(notify.NotifyError) as e:
+            n.send("hello")
+        self.assertIn("did not deliver", str(e.exception))
+
+    def test_no_telegram_credential_in_the_code(self):
+        """CLAUDE.md 6: hermes owns the gateway, so Spine must never hold a
+        Telegram credential. If this fails, the delivery design drifted.
+
+        Checks string literals that are not docstrings, rather than the raw
+        source. The module prose names TELEGRAM_BOT_TOKEN precisely to explain
+        why it is absent, and a test that cannot tell an explanation from an
+        implementation is a test that punishes documentation."""
+        import ast
+        import inspect
+        from core import notify
+
+        tree = ast.parse(inspect.getsource(notify))
+
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+                body = getattr(node, "body", None)
+                if (body and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    docstrings.add(id(body[0].value))
+
+        literals = [n.value for n in ast.walk(tree)
+                    if isinstance(n, ast.Constant)
+                    and isinstance(n.value, str)
+                    and id(n) not in docstrings]
+
+        for banned in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "api.telegram.org"):
+            for lit in literals:
+                self.assertNotIn(banned, lit,
+                                 "core.notify references " + banned + " in code")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -344,18 +344,35 @@ class TestRunner(unittest.TestCase):
 
     def test_pending_capabilities_name_their_phase(self):
         """Capabilities not yet built name the phase that delivers them,
-        rather than raising AttributeError three frames deep. ctx.db went
-        live in Phase 2; notify is the one still pending."""
+        rather than raising AttributeError three frames deep.
+
+        notify was the last live user of _Pending and graduated on
+        2026-09-30, so this exercises the mechanism directly. The mechanism
+        is what is worth keeping: the next unbuilt capability should also
+        announce itself instead of failing obscurely."""
+        from core.job import _Pending
+
+        pending = _Pending("teleport", "Phase 12")
+
+        with self.assertRaises(NotImplementedError) as call:
+            pending.send("hi")
+        self.assertIn("Phase 12", str(call.exception))
+        self.assertIn("teleport", str(call.exception))
+
+        # Attribute access must fail the same way, not return a mystery object.
+        with self.assertRaises(NotImplementedError):
+            pending.anything_at_all
+
+    def test_notify_is_no_longer_pending(self):
+        """The counterpart: ctx.notify is real now. If this ever starts
+        raising NotImplementedError again, delivery has regressed."""
         seen = {}
 
         def peek(ctx):
-            try:
-                ctx.notify.send("hi")
-            except NotImplementedError as exc:
-                seen["msg"] = str(exc)
+            seen["type"] = type(ctx.notify).__name__
             return {}
         runner.run_job(self._job(peek), log=self.log)
-        self.assertIn("Phase 3", seen["msg"])
+        self.assertEqual(seen["type"], "Notifier")
 
 
 class TestRunShell(unittest.TestCase):

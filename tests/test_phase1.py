@@ -358,13 +358,19 @@ class TestContractIntegration(DbCase):
         ctx = Ctx.build(j, lambda *a, **k: None, ROOT)
         self.assertEqual(ctx.db.source, "x4")
 
-    def test_notify_still_pending_until_phase_3(self):
+    def test_notify_is_wired_and_does_not_send_on_construction(self):
+        """ctx.notify became a real Notifier on 2026-09-30.
+
+        Deliberately does not call send(). Building the context must not open
+        a socket, or the whole suite acquires a dependency on hermes being up
+        -- the same mistake that made the smart-tier test run a 3.4 GB
+        inference. Construction only reads two values from .env."""
         from core.job import Ctx
+        from core import notify
+
         j = validate({"id": "x5", "schedule": "0 6 * * *"})
         ctx = Ctx.build(j, lambda *a, **k: None, ROOT)
-        with self.assertRaises(NotImplementedError) as e:
-            ctx.notify.send("hi")
-        self.assertIn("Phase 3", str(e.exception))
+        self.assertIsInstance(ctx.notify, notify.Notifier)
 
 
 class TestPlainSurface(unittest.TestCase):
