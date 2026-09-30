@@ -526,5 +526,61 @@ class TestHeartbeatWritesNoItems(BridgeCase):
             self.assertIn(field, v)
 
 
+class TestPlaceholderAddressParts(unittest.TestCase):
+    """ACRIS writes placeholders instead of leaving fields empty.
+
+    265 of 28407 legals carry the literal string "N/A" as street_number. The
+    old address_of treated any truthy value as real, so the brief showed
+    "N/A 16 AVENUE, Brooklyn" on 2026-09-30. PLUTO could not cover for it:
+    PLUTO_BOROS loads Manhattan and Brooklyn only, so every one of those rows
+    joined to a NULL PLUTO address and fell through to the ACRIS parts.
+    """
+
+    def _row(self, **kw):
+        base = {"address": None, "street_number": None, "street_name": None,
+                "unit": None, "bbl": "3026390006"}
+        base.update(kw)
+        return base
+
+    def test_the_literal_na_is_dropped_from_the_line(self):
+        row = self._row(street_number="N/A", street_name="NORTH 14 STREET")
+        self.assertEqual(acris.address_of(row), "NORTH 14 STREET")
+
+    def test_placeholders_are_matched_case_folded(self):
+        for probe in ("N/A", "n/a", "N/a", " NA "):
+            row = self._row(street_number=probe, street_name="BATH AVENUE")
+            self.assertEqual(acris.address_of(row), "BATH AVENUE", probe)
+
+    def test_a_real_street_number_still_survives(self):
+        """The fix must not eat legitimate values. This is the one that would
+        make the change worse than the bug."""
+        row = self._row(street_number="158-162", street_name="WEST 25TH STREET")
+        self.assertEqual(acris.address_of(row), "158-162 WEST 25TH STREET")
+
+    def test_a_placeholder_unit_adds_no_hash(self):
+        row = self._row(street_number="12", street_name="POST COURT", unit="N/A")
+        self.assertEqual(acris.address_of(row), "12 POST COURT")
+
+    def test_a_real_unit_is_still_appended(self):
+        row = self._row(street_number="12", street_name="POST COURT", unit="4B")
+        self.assertEqual(acris.address_of(row), "12 POST COURT #4B")
+
+    def test_a_placeholder_pluto_address_falls_through(self):
+        """PLUTO is preferred, but not when what it holds is a placeholder."""
+        row = self._row(address="N/A", street_number="12",
+                        street_name="SCHENCK AVENUE")
+        self.assertEqual(acris.address_of(row), "12 SCHENCK AVENUE")
+
+    def test_all_placeholders_falls_back_to_the_bbl(self):
+        """Never an empty title. The BBL is at least something to look up."""
+        row = self._row(street_number="N/A", street_name="N/A")
+        self.assertEqual(acris.address_of(row), "3026390006")
+
+    def test_zero_is_a_placeholder_not_a_street_number(self):
+        """Deliberate: no NYC address is number 0, and a bare 0 in this field
+        is the same kind of filler as N/A."""
+        self.assertEqual(acris._real("0"), "")
+
+
 if __name__ == "__main__":
     unittest.main()

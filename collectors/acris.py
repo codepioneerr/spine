@@ -121,14 +121,32 @@ def importance(amount: float | None, unitsres: int | None) -> int:
     return max(0, min(100, base))
 
 
+# ACRIS writes a literal placeholder rather than leaving a field empty: 265 of
+# 28407 legals carry street_number "N/A", which reassembled into titles like
+# "N/A 16 AVENUE, Brooklyn" in the brief on 2026-09-30. PLUTO cannot cover for
+# it either -- PLUTO_BOROS loads Manhattan and Brooklyn only, so an outer
+# borough lot has no address to fall back to and every one of those 265 rows
+# joined to a NULL PLUTO address. Compared case-folded, because the same field
+# arrives as "n/a" elsewhere in city data.
+PLACEHOLDER_PARTS = frozenset({"n/a", "na", "none", "null", "-", "0", "unknown"})
+
+
+def _real(value) -> str:
+    """The value as a clean string, or empty if it is a placeholder."""
+    s = str(value).strip() if value is not None else ""
+    return "" if s.casefold() in PLACEHOLDER_PARTS else s
+
+
 def address_of(row) -> str:
     """PLUTO's address if we have it, else reassemble ACRIS's parts."""
-    if row["address"]:
-        return str(row["address"]).strip()
-    parts = [row["street_number"], row["street_name"]]
-    line = " ".join(str(p).strip() for p in parts if p)
-    if row["unit"]:
-        line = f"{line} #{row['unit']}"
+    pluto = _real(row["address"])
+    if pluto:
+        return pluto
+    line = " ".join(p for p in (_real(row["street_number"]),
+                                _real(row["street_name"])) if p)
+    unit = _real(row["unit"])
+    if unit:
+        line = line + " #" + unit
     return line.strip() or (row["bbl"] or "unknown address")
 
 
