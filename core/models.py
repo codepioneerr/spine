@@ -255,6 +255,39 @@ class OllamaProvider(Provider):
 
     2.8 tok/s is the real constraint on what this tier can be asked to do.
     One brief a day is comfortable. Anything conversational is not.
+
+    ## Whose daemon this is
+
+    Not ours. It is `personal-os-ollama.service`, a systemd --user unit owned by
+    the `Codex` account, bound to 127.0.0.1:11434, with the weights under
+    /home/Codex/.local/share/personal-os/models at mode 700 -- `pioneer` cannot
+    read the model files at all. Spine is an anonymous localhost client of
+    somebody else's service.
+
+    That is deliberate, and it was chosen over running our own. A second daemon
+    needs a second 3.2 GB copy of the weights, and two instances each honouring
+    OLLAMA_MAX_LOADED_MODELS=1 can still hold one model EACH -- roughly 7.2 GB
+    on a 7.6 GB box, which is the swap-or-OOM outcome CLAUDE.md section 1
+    forbids outright. The shared single instance is what keeps this box safe, so
+    the dependency buys a safety property rather than costing one.
+
+    What the service sets, and why it matters here:
+
+        OLLAMA_HOST=127.0.0.1:11434     loopback only, no auth, any local user
+        OLLAMA_MAX_LOADED_MODELS=1      one model resident, ever
+        OLLAMA_NUM_PARALLEL=1           inference serialises across BOTH systems
+        OLLAMA_CONTEXT_LENGTH=4096      matches the num_ctx pinned below
+
+    Consequences to keep in mind:
+
+    - If Codex stops the service, re-ports it, or removes qwen3.5:4b, available()
+      says so and the brief ships layer 1 with no commentary. That is the whole
+      reason core.brief does not depend on a model.
+    - Requests serialise. Measured low risk: personal_os runs its own brief at
+      11:30 UTC against ours at 09:40, and its once-a-minute dashboard timer only
+      shells out to `systemctl is-active` -- it never infers. If that changes, the
+      symptom here is latency, not failure, and the 900 s job timeout absorbs it.
+    - The model file is not ours to delete, move, or re-quantise.
     """
 
     DEFAULT_HOST = "http://127.0.0.1:11434"

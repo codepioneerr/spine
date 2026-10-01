@@ -148,6 +148,74 @@ does, what it costs in RAM, and why stdlib can't. `httpx`/`requests` and
   message gateway is not on the critical path. Spine talks *to* it via
   `notify`.
 
+  *Amended Sept 30 2026.* Delivery landed, and it goes through Hermes rather
+  than around it: one webhook route registered with `--deliver-only`, which
+  relays the rendered brief verbatim with no agent invocation and no model
+  cost. Spine holds an HMAC secret for a loopback route and no bot token. The
+  one thing this did require was enabling Hermes's webhook platform, which
+  meant two gateway restarts — taken with a config backup and Telegram
+  verified afterwards each time.
+- **`personal_os` is not touched either, and it is a peer, not a silo.** A
+  second system runs on this box as user `Codex`: stdlib-only core, immutable
+  proposals requiring explicit confirmation, unknown formats rejected rather
+  than interpreted by a model, an atomic $5/month reservation ledger, delivery
+  receipts. That is this document's philosophy, arrived at independently. It
+  would be a mistake to absorb it.
+
+  **The boundary, decided Sept 30 2026:**
+
+  | | Owner | Delivers | Remit |
+  |---|---|---|---|
+  | 05:40 ET | **Spine** | `collectors/brief.py` | market and property signal — deeds, prediction-market moves, paper positions |
+  | 07:30 ET | **personal_os** | `personal-os-morning.timer` | calendar, tasks, email review |
+
+  Two morning messages is a deliberate division of remit, not drift. Written
+  down because §5 exists to stop silo #11, and the honest risk here is not
+  that these two overlap today — it is that in six months nobody remembers the
+  split was chosen. If the remits start bleeding into each other, that is the
+  signal to revisit, and the integration pattern is already proven: read the
+  other system's state read-only through `core.bridge`, exactly as Phase 2b
+  does with darkweb-jobs. It needs an ACL granting `pioneer` read on
+  `/home/Codex/personal-os-dev-state`, and deliberately **not** on its
+  `private/` directory, which holds a bot token and a health token.
+- **The local model is borrowed, and that is the safe choice.** `smart` runs
+  against `personal-os-ollama.service` — Codex's systemd unit, bound to
+  `127.0.0.1:11434`, with the weights under `/home/Codex/.local/share/personal-os/models`
+  at mode 700, so `pioneer` cannot read them. Spine is an anonymous localhost
+  client.
+
+  Giving Spine its own daemon was considered and rejected. It needs a second
+  3.2 GB copy of the weights, and two instances each honouring
+  `OLLAMA_MAX_LOADED_MODELS=1` can still hold one model *each* — about 7.2 GB
+  on a 7.6 GB box, which is the swap-or-OOM outcome §1 forbids. **The shared
+  single instance is what keeps an 8 GB box safe**, so the coupling is a
+  feature bought with a dependency, not an oversight. If Codex stops the
+  service or removes the model, `available()` reports it and the brief ships
+  layer 1 without commentary — which is why layer 1 does not depend on a
+  model.
+
+### Model spend is not fully metered
+
+Three things on this box can spend model budget and only two of them are
+counted:
+
+| | Budget | Metered by |
+|---|---|---|
+| Spine | `SPINE_MONTHLY_USD_CAP` $25, target $5, pre-flight | `core.costs` |
+| personal_os | $5/month atomic reservation ledger | its own ledger |
+| **Hermes** | none | **nothing** |
+
+Both ledgers currently read $0 — Spine's calls are local and personal_os
+reports no paid call made. Hermes is the one actually consuming capacity: it
+is hitting Gemini `429 RESOURCE_EXHAUSTED` on the free tier, and
+personal_os's README says plainly that "existing Hermes conversation costs are
+not metered here." Spine does not meter it either.
+
+So the first number that will surprise Nick is the one neither system watches.
+Unifying the ledgers is not worth building while both read zero; noticing that
+Hermes is unmetered **is** worth writing down, because a cap that misses the
+only live spender is not a cap.
+
 ---
 
 ## 7. Permissions — v1 is read-and-recommend
