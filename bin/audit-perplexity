@@ -71,7 +71,7 @@ REQUEST_FEE_USD = {"low": 0.005, "high": 0.022}
 ASSUMED_TOKENS_IN = 400
 ASSUMED_TOKENS_OUT = 600
 
-CANDIDATE_ROOTS = ["~/darkweb-jobs", "~/hermes", "~/collectors", "~/spine"]
+CANDIDATE_ROOTS = ["~/projects/darkweb-jobs", "~/hermes", "~/collectors", "~/projects/spine"]
 
 PPLX = re.compile(r"perplexity|pplx|sonar", re.I)
 

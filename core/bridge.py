@@ -63,7 +63,7 @@ def dwj_root() -> str:
     available rather than a way to contradict a known fact.
     """
     return os.environ.get(
-        "SPINE_DWJ_ROOT", os.path.expanduser("~/darkweb-jobs"))
+        "SPINE_DWJ_ROOT", os.path.expanduser("~/projects/darkweb-jobs"))
 
 
 def db_file(name: str) -> str:
