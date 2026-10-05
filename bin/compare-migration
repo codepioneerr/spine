@@ -46,9 +46,58 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from core import bridge                                    # noqa: E402
+from core import bridge, paths                             # noqa: E402
 from core.store import Store                               # noqa: E402
 from collectors import acris, eventbot, polymarket         # noqa: E402
+
+# Tuning values this tool must read from .env, named explicitly.
+#
+# Deliberately an allowlist and not a blanket load. .env also holds
+# ANTHROPIC_API_KEY, GEMINI_API_KEY, SPINE_BRIEF_WEBHOOK_SECRET and a Telegram
+# bot token; pushing those into the environment of a script that shells nothing
+# and needs none of them is gratuitous exposure. These three are thresholds and
+# a path — nothing here is a secret.
+DOTENV_KEYS = (
+    "SPINE_PROPTECH_MIN_AMOUNT",
+    "SPINE_POLYMARKET_MIN_VOLUME",
+    "SPINE_DWJ_ROOT",
+)
+
+
+def load_tuning() -> dict:
+    """Make .env's thresholds visible to bridge.env_int, as bin/run.sh does.
+
+    Without this, the burn-in reads DIFFERENT thresholds than the collectors it
+    exists to verify. bin/run.sh sources .env before invoking core.runner; this
+    script is called straight from cron and does not, so on 2026-10-01 the
+    comparison computed the ACRIS source at the $1,000,000 code default while
+    the collector had been filling the store at the $5,000,000 set in .env.
+
+    It passed only by luck: the store had been seeded at $1M and the $5M set is
+    a subset of it, so nothing looked missing. Rebuild the store and the same
+    code reports 88 phantom misses — or lower the threshold in .env and it
+    would hide real ones instead.
+
+    A verifier that does not read the configuration of the thing it verifies is
+    not verifying it. Uses core.job._Secrets rather than a second .env parser,
+    so the mode-600 refusal and the quoting rules stay in exactly one place,
+    and setdefault semantics so a real environment variable still wins.
+    """
+    from core.job import _Secrets
+    secrets = _Secrets(paths.root())
+    loaded = {}
+    for key in DOTENV_KEYS:
+        if key in os.environ:
+            continue
+        try:
+            val = secrets.get(key)
+        except Exception as exc:
+            print(f"warning: could not read .env — {exc}", file=sys.stderr)
+            return loaded
+        if val:
+            os.environ[key] = val
+            loaded[key] = val
+    return loaded
 
 # Each entry: how to read the source, and how to name what it produces so
 # the key can be compared against the store.
@@ -134,10 +183,100 @@ def compare(name: str, spec: dict, store: Store, verbose: bool) -> int:
     return len(missing)
 
 
+# NYC's own publishing lag is roughly a month, so an ACRIS feed that has been
+# quiet for a few weeks is unremarkable. Past this the pause itself is worth a
+# look -- not because anything is wedged, but because "upstream has been silent
+# for two months" is a fact about the data Phase 3 is being sized against.
+FEED_PAUSE_GRACE_DAYS = 45
+
+
+def feed_state(verbose: bool = False) -> int:
+    """What darkweb-jobs last concluded about the ACRIS feed. 0 unless wedged.
+
+    This section exists because the burn-in was about to start reporting a
+    false alarm. The ACRIS cursor has been parked at 2026-08-31 since early
+    September, re-reading the same 658 documents nightly, and any staleness
+    check written on cursor age alone would have flagged that every morning
+    for the rest of the burn-in week -- while nothing was wrong.
+
+    Only darkweb-jobs can tell a pause from a wedge, because only darkweb-jobs
+    talks to Socrata. So it writes the verdict and this reads it. An absent
+    verdict says so plainly rather than assuming the good case: a collector
+    running older code is exactly the situation where a reassuring default
+    would hide the thing worth seeing.
+    """
+    print("ACRIS upstream feed")
+    try:
+        state = bridge.kv_get("proptech", "acris_feed_state")
+        cursor = bridge.kv_get("proptech", "acris_last_recorded") or "unset"
+        upstream = bridge.kv_get("proptech", "acris_upstream_max")
+        checked = bridge.kv_get("proptech", "acris_feed_checked")
+        note = bridge.kv_get("proptech", "acris_feed_note") or ""
+    except bridge.BridgeUnavailable as exc:
+        print(f"  UNAVAILABLE — {exc}\n")
+        return 0
+
+    if not state:
+        print("  not classified — this proptech.db predates the feed check. "
+              "Run `python3 -m proptech.collect` in darkweb-jobs once, then "
+              "a parked cursor can be read correctly instead of guessed at.\n")
+        return 0
+
+    print(f"  cursor   {cursor}")
+    print(f"  upstream {upstream or '(not probed — cursor advanced)'}")
+    print(f"  checked  {checked}")
+
+    if state == "cursor_wedged":
+        print(f"  WEDGED   {note}")
+        print("  This is a real defect, not a quiet upstream. The city has "
+              "published past our cursor and we did not pick it up.\n")
+        return 1
+
+    if state == "advancing":
+        print(f"  ok       {note}\n")
+        return 0
+
+    if state == "unknown":
+        print(f"  unknown  {note}")
+        print("  Not an alarm and not an all-clear. The fetch succeeded; only "
+              "the diagnostic probe did not.\n")
+        return 0
+
+    # feed_paused — the normal steady state, and the whole point of this check.
+    age = _days_since(upstream)
+    if age is not None and age > FEED_PAUSE_GRACE_DAYS:
+        print(f"  paused   {note}")
+        print(f"  Upstream has been silent {age} days, past the "
+              f"{FEED_PAUSE_GRACE_DAYS}-day grace. Nothing is wedged — our "
+              "cursor matches the city's own maximum — but a pause this long "
+              "is worth confirming on the NYC Open Data page.\n")
+        return 0
+
+    print(f"  paused   {note}")
+    print("  Not a stall. The cursor matches the city's own maximum, so the "
+          "nightly re-read of the boundary day is working as designed.\n")
+    return 0
+
+
+def _days_since(stamp: str | None) -> int | None:
+    """Whole days between an ACRIS timestamp and now, or None if unparseable."""
+    if not stamp:
+        return None
+    from datetime import datetime, timezone
+    try:
+        when = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc).replace(tzinfo=None) - when).days
+
+
 def preview() -> int:
     """What each collector would emit right now, and what the ACRIS
     threshold is actually costing. No writes."""
     print("PREVIEW — what the collectors would emit now. Nothing is written.\n")
+    # Printed before the numbers, because a paused upstream is the difference
+    # between "this threshold is too high" and "there is nothing to threshold".
+    feed_state()
 
     for name, spec in SOURCES.items():
         try:
@@ -152,25 +291,113 @@ def preview() -> int:
             print(f"    [{i['importance']:>3}] {i['title'][:70]}")
         print()
 
-    # The threshold sweep. This is the number that sizes Phase 3's cap.
+    acris_sweep()
+    polymarket_sweep()
+    return 0
+
+
+def acris_sweep() -> None:
+    """What each ACRIS threshold costs per day. Sizes Phase 3's cap."""
     try:
         conn = bridge.connect("proptech")
     except bridge.BridgeUnavailable as exc:
-        print(f"threshold sweep skipped — {exc}")
-        return 0
+        print(f"ACRIS threshold sweep skipped — {exc}\n")
+        return
     try:
         since = bridge.since_iso(24 * 30)
+        active = bridge.env_int("SPINE_PROPTECH_MIN_AMOUNT",
+                                acris.DEFAULT_MIN_AMOUNT)
         print("ACRIS documents in the last 30 days by threshold:")
         print(f"  {'threshold':>12}  {'docs':>6}  {'per day':>8}")
         for t in (0, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000):
             rows = acris.select(conn, since, t, limit=100_000)
             n = len({r["document_id"] for r in rows})
-            print(f"  {'$' + format(t, ','):>12}  {n:>6}  {n / 30:>8.1f}")
+            mark = "  <- active" if t == active else ""
+            print(f"  {'$' + format(t, ','):>12}  {n:>6}  {n / 30:>8.1f}{mark}")
         print("\n  Set SPINE_PROPTECH_MIN_AMOUNT so 'per day' is a number "
               "you would actually read.")
+        print("  CAVEAT: these counts are by fetched_ts over 30 days, measured "
+              "while\n  the city was publishing a backlog. With the feed "
+              "paused past Aug 31 the\n  true inflow of NEW documents is "
+              "currently 0/day — see the feed section.\n")
     finally:
         conn.close()
-    return 0
+
+
+# 30 days of 6-hour windows. The burn-in's own lookback is
+# polymarket.LOOKBACK_HOURS, so this is how many chances per month the
+# comparison gets to see anything at all.
+SWEEP_DAYS = 30
+
+
+def polymarket_sweep() -> None:
+    """What each volume threshold costs — and whether the burn-in can verify it.
+
+    The second column is the one that matters and the reason this sweep exists.
+    `bin/compare-migration` compares a 6-hour window, and at the shipped
+    250,000 threshold a qualifying political jump happens about 1.4 times a
+    day — so most windows are legitimately empty, the comparison prints "this
+    verifies nothing", and the polymarket bridge can never be signed off.
+    CLAUDE.md is explicit that zero rows on both sides is not a pass.
+
+    So "jumps/day" alone is not the decision. "What fraction of 6h windows
+    contain at least one" is, because that is the probability the burn-in
+    learns anything on any given run. Pick a threshold where that number is
+    high enough to certify the bridge, then decide separately whether the
+    resulting volume is readable in a brief.
+    """
+    try:
+        conn = bridge.connect("prediction")
+    except bridge.BridgeUnavailable as exc:
+        print(f"Polymarket threshold sweep skipped — {exc}\n")
+        return
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    window_s = polymarket.LOOKBACK_HOURS * 3600
+    total_windows = max(1, SWEEP_DAYS * 24 * 3600 // window_s)
+    active = bridge.env_int("SPINE_POLYMARKET_MIN_VOLUME",
+                            polymarket.DEFAULT_MIN_VOLUME)
+
+    try:
+        since = bridge.since_iso(24 * SWEEP_DAYS)
+        print(f"Polymarket political jumps in the last {SWEEP_DAYS} days "
+              f"by 24h-volume threshold:")
+        print(f"  {'threshold':>12}  {'jumps':>6}  {'per day':>8}  "
+              f"{'windows with data':>19}")
+        for t in (25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000):
+            rows = polymarket.select(conn, since, t, limit=200_000)
+            buckets = set()
+            for r in rows:
+                age = (now - _parse(r["ts"], now)).total_seconds()
+                if 0 <= age < SWEEP_DAYS * 86400:
+                    buckets.add(int(age // window_s))
+            pct = 100 * len(buckets) / total_windows
+            mark = "  <- active" if t == active else ""
+            print(f"  {'$' + format(t, ','):>12}  {len(rows):>6}  "
+                  f"{len(rows) / SWEEP_DAYS:>8.1f}  "
+                  f"{len(buckets):>4}/{total_windows} ({pct:>3.0f}%)"
+                  f"{mark}")
+        print(f"\n  'windows with data' = how many {polymarket.LOOKBACK_HOURS}h "
+              "windows held at least one\n  qualifying jump, out of "
+              f"{total_windows} in {SWEEP_DAYS} days. That is the share of "
+              "burn-in runs\n  that would actually verify the bridge rather "
+              "than printing 'verifies nothing'.")
+        print("  Set SPINE_POLYMARKET_MIN_VOLUME. The filter is political=1 "
+              "AND volume24h >=\n  threshold, so these are exactly the rows "
+              "the collector would emit.\n")
+    finally:
+        conn.close()
+
+
+def _parse(stamp: str, fallback):
+    """A darkweb-jobs timestamp to an aware datetime, or `fallback`."""
+    from datetime import datetime, timezone
+    try:
+        return datetime.strptime(str(stamp)[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return fallback
 
 
 def main(argv=None) -> int:
@@ -181,6 +408,11 @@ def main(argv=None) -> int:
     ap.add_argument("--verbose", action="store_true",
                     help="list the missing keys")
     args = ap.parse_args(argv)
+
+    loaded = load_tuning()
+    if loaded:
+        print("from .env: "
+              + ", ".join(f"{k}={v}" for k, v in sorted(loaded.items())))
 
     if args.preview:
         return preview()
@@ -197,6 +429,10 @@ def main(argv=None) -> int:
             worst = max(worst, n)
     finally:
         store.close()
+
+    if "acris" in names:
+        print()
+        worst = max(worst, feed_state(args.verbose))
 
     print("\nrecent misses mean the bridge is not keeping up.")
     print("old misses predate the collector's first run and are expected.")

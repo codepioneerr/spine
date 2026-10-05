@@ -582,5 +582,93 @@ class TestPlaceholderAddressParts(unittest.TestCase):
         self.assertEqual(acris._real("0"), "")
 
 
+class TestBurnInReadsTheSameConfig(unittest.TestCase):
+    """bin/compare-migration must read the thresholds the collectors use.
+
+    bin/run.sh sources .env before invoking core.runner; the burn-in is called
+    straight from cron and does not. On 2026-10-01 that meant the comparison
+    computed the ACRIS source at the $1,000,000 code default while the
+    collector had been filling the store at the $5,000,000 in .env, and it
+    passed only because the store happened to have been seeded at $1M and the
+    $5M set is a subset of it. Rebuild the store and the same code reports 88
+    phantom misses; lower the threshold in .env and it would hide real ones.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.machinery
+        import importlib.util
+        path = os.path.join(ROOT, "bin", "compare-migration")
+        spec = importlib.util.spec_from_loader(
+            "cmig", importlib.machinery.SourceFileLoader("cmig", path))
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def setUp(self):
+        self._env = dict(os.environ)
+        self._dir = tempfile.TemporaryDirectory()
+        env_path = os.path.join(self._dir.name, ".env")
+        with open(env_path, "w") as fh:
+            fh.write(
+                "SPINE_PROPTECH_MIN_AMOUNT=5000000\n"
+                "SPINE_POLYMARKET_MIN_VOLUME=100000\n"
+                "ANTHROPIC_API_KEY=sk-should-never-be-exported\n"
+                "SPINE_BRIEF_WEBHOOK_SECRET=hmac-should-never-be-exported\n"
+                "TELEGRAM_BOT_TOKEN=token-should-never-be-exported\n")
+        os.chmod(env_path, 0o600)
+        self._root = self.mod.paths.root
+        self.mod.paths.root = lambda: self._dir.name
+        for k in self.mod.DOTENV_KEYS:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        self.mod.paths.root = self._root
+        os.environ.clear()
+        os.environ.update(self._env)
+        self._dir.cleanup()
+
+    def test_thresholds_are_loaded(self):
+        loaded = self.mod.load_tuning()
+        self.assertEqual(loaded["SPINE_PROPTECH_MIN_AMOUNT"], "5000000")
+        self.assertEqual(loaded["SPINE_POLYMARKET_MIN_VOLUME"], "100000")
+        # And they are actually visible to the function the collectors use.
+        self.assertEqual(
+            bridge.env_int("SPINE_PROPTECH_MIN_AMOUNT", 1_000_000), 5_000_000)
+
+    def test_secrets_are_never_exported(self):
+        """The load is an allowlist, not a blanket source of .env. A tool that
+        shells nothing and needs no credential should not be carrying an API
+        key, an HMAC secret and a bot token in its environment."""
+        self.mod.load_tuning()
+        for leaked in ("ANTHROPIC_API_KEY", "SPINE_BRIEF_WEBHOOK_SECRET",
+                       "TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY"):
+            self.assertNotIn(leaked, os.environ, leaked)
+
+    def test_a_real_environment_variable_still_wins(self):
+        """setdefault semantics: an operator overriding on the command line
+        must not be silently replaced by the file."""
+        os.environ["SPINE_PROPTECH_MIN_AMOUNT"] = "250000"
+        loaded = self.mod.load_tuning()
+        self.assertNotIn("SPINE_PROPTECH_MIN_AMOUNT", loaded)
+        self.assertEqual(os.environ["SPINE_PROPTECH_MIN_AMOUNT"], "250000")
+
+    def test_a_world_readable_env_does_not_crash_the_burn_in(self):
+        """_Secrets refuses a .env that is not 600. The burn-in must report
+        that and carry on, not die -- it is evidence-gathering, not a job."""
+        import contextlib
+        import io as _io
+        os.chmod(os.path.join(self._dir.name, ".env"), 0o644)
+        err = _io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.mod.load_tuning(), {})
+        self.assertIn("must be 600", err.getvalue(),
+                      "it must SAY why it gave up, not fail silently")
+
+    def test_the_allowlist_holds_no_secret_shaped_names(self):
+        for key in self.mod.DOTENV_KEYS:
+            for bad in ("KEY", "SECRET", "TOKEN", "PASSWORD"):
+                self.assertNotIn(bad, key.upper(), key)
+
+
 if __name__ == "__main__":
     unittest.main()

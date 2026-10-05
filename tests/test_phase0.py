@@ -297,6 +297,13 @@ class TestRunner(unittest.TestCase):
     def setUp(self):
         self.logs = []
         self.log = lambda m, **k: self.logs.append(m)
+        # Keep run_job's state writes off the live var/state that the console
+        # reads. See the note in test_phase2.py.
+        self._write_state = registry.write_state
+        registry.write_state = lambda job_id, data: None
+
+    def tearDown(self):
+        registry.write_state = self._write_state
 
     def _job(self, fn, **over):
         j = job(id="probe", **over)
@@ -373,6 +380,176 @@ class TestRunner(unittest.TestCase):
             return {}
         runner.run_job(self._job(peek), log=self.log)
         self.assertEqual(seen["type"], "Notifier")
+
+
+class TestRamSkipAlert(unittest.TestCase):
+    """The RAM guard refusing is correct. Refusing in silence is not.
+
+    `brief` needs 4,524 MB free on a 7,815 MB box, so one interactive session
+    left running overnight is enough to cross the line — at which point Nick
+    gets no 05:40 message and no reason. These tests pin the alert on the one
+    gate that means "a job you expected did not happen", and pin the much more
+    important property that nothing here can turn a correct skip into a
+    failure.
+    """
+
+    NIGHT = datetime(2026, 9, 3, 9, 40, tzinfo=UTC)      # 05:40 EDT, as cron
+    NOON = datetime(2026, 9, 3, 16, 0, tzinfo=UTC)
+
+    class Stub:
+        """A notifier that never opens a socket.
+
+        Injected rather than mocked at import time because the live .env on
+        this box has a working hermes route in it — a test that built the real
+        Notifier would send Nick a Telegram every time the suite ran.
+        """
+
+        def __init__(self, configured=True, boom=False):
+            self.sent, self._configured, self._boom = [], configured, boom
+
+        def configured(self):
+            return self._configured
+
+        def send(self, text):
+            if self._boom:
+                raise RuntimeError("hermes is down")
+            self.sent.append(text)
+            return True
+
+    def setUp(self):
+        self.logs = []
+        self.log = lambda m, **k: self.logs.append(m)
+        self.tmp = tempfile.mkdtemp()
+        self._real_path = runner._alert_state_path
+        self._real_avail = governor.available_mb
+        # These tests run under the real job id "brief" on purpose — ram_mb=3500
+        # and the 4,524 MB threshold are the numbers that actually matter — so
+        # the state write MUST be stubbed, or the suite leaves a fake "skipped"
+        # in var/state/brief.json and the console reports a brief that never
+        # failed.
+        self._write_state = registry.write_state
+        registry.write_state = lambda job_id, data: None
+        runner._alert_state_path = lambda: os.path.join(self.tmp, "alerts.json")
+        # Below brief's 3500 + 1024, so the guard refuses deterministically
+        # instead of depending on what this machine happens to have free.
+        governor.available_mb = lambda: 4210
+
+    def tearDown(self):
+        runner._alert_state_path = self._real_path
+        governor.available_mb = self._real_avail
+        registry.write_state = self._write_state
+        os.environ.pop("SPINE_RAM_ALERT", None)
+
+    def _brief(self):
+        j = job(id="brief", schedule="40 9 * * *", ram_mb=3500,
+                weight="heavy", window="night", tier="smart")
+        return type(j)(**{**j.__dict__, "run": lambda ctx: {}})
+
+    def test_ram_skip_alerts_with_the_numbers_in_it(self):
+        n = self.Stub()
+        code, state = runner.run_job(self._brief(), when=self.NIGHT,
+                                     log=self.log, notifier=n)
+        self.assertEqual(code, runner.EXIT_OK, "an alert must not page cron")
+        self.assertEqual(state["outcome"], "skipped")
+        self.assertEqual(state["gate"], "ram")
+        self.assertTrue(state["alerted"])
+        self.assertEqual(len(n.sent), 1)
+        # The message has to carry the arithmetic, not just "low memory" —
+        # 4210 against 4524 is what tells Nick it was close rather than broken.
+        self.assertIn("4524", n.sent[0])
+        self.assertIn("4210", n.sent[0])
+        self.assertIn("brief", n.sent[0])
+
+    def test_window_skip_stays_quiet(self):
+        """A night job invoked at noon is bookkeeping, not news.
+
+        If this ever starts alerting, the channel fills with routine refusals
+        and the one that mattered goes unread — which is the failure this
+        whole feature exists to fix, reintroduced from the other direction.
+        """
+        n = self.Stub()
+        code, state = runner.run_job(self._brief(), when=self.NOON,
+                                     log=self.log, notifier=n)
+        self.assertEqual(state["gate"], "window")
+        self.assertNotIn("alerted", state)
+        self.assertEqual(n.sent, [])
+
+    def test_repeat_refusals_are_throttled(self):
+        first, second = self.Stub(), self.Stub()
+        runner.run_job(self._brief(), when=self.NIGHT, log=self.log,
+                       notifier=first)
+        _, state = runner.run_job(self._brief(), when=self.NIGHT,
+                                  log=self.log, notifier=second)
+        self.assertEqual(len(first.sent), 1)
+        self.assertEqual(second.sent, [], "one alert per quiet period, not one per tick")
+        self.assertFalse(state["alerted"])
+
+    def test_a_dead_gateway_does_not_turn_a_skip_into_a_failure(self):
+        """The load-bearing test. The alert is allowed to fail; the skip is not.
+
+        If delivery raising ever propagates, the RAM guard stops being the
+        safe option it was built to be — a refusal would become a non-zero
+        exit and cron mail, which is worse than the silence it replaced.
+        """
+        n = self.Stub(boom=True)
+        code, state = runner.run_job(self._brief(), when=self.NIGHT,
+                                     log=self.log, notifier=n)
+        self.assertEqual(code, runner.EXIT_OK)
+        self.assertEqual(state["outcome"], "skipped")
+        self.assertFalse(state["alerted"])
+        self.assertIn("ram alert FAILED", self.logs)
+
+    def test_unconfigured_delivery_says_so_rather_than_erroring(self):
+        n = self.Stub(configured=False)
+        code, state = runner.run_job(self._brief(), when=self.NIGHT,
+                                     log=self.log, notifier=n)
+        self.assertEqual(code, runner.EXIT_OK)
+        self.assertFalse(state["alerted"])
+        self.assertIn("ram alert not sent", self.logs)
+
+    def test_env_kill_switch(self):
+        os.environ["SPINE_RAM_ALERT"] = "0"
+        n = self.Stub()
+        _, state = runner.run_job(self._brief(), when=self.NIGHT,
+                                  log=self.log, notifier=n)
+        self.assertFalse(state["alerted"])
+        self.assertEqual(n.sent, [])
+
+    def test_force_runs_the_job_and_says_nothing(self):
+        """--force is Nick deciding, at the keyboard. He does not need a
+        message telling him what he just chose."""
+        n = self.Stub()
+        _, state = runner.run_job(self._brief(), when=self.NIGHT,
+                                  log=self.log, notifier=n, force=True)
+        self.assertEqual(state["outcome"], "ok")
+        self.assertEqual(n.sent, [])
+
+    def test_the_message_quotes_the_figure_the_refusal_was_made_on(self):
+        """A re-read of /proc a moment later can differ. If the alert ever
+        quotes a number >= what it says is needed, it reads as a broken guard
+        rather than a tight box."""
+        n = self.Stub()
+        # Memory "recovers" the instant the guard finishes, as it would on a
+        # box where an editor was just closed.
+        calls = []
+
+        def drifting():
+            calls.append(1)
+            return 4210 if len(calls) == 1 else 6800
+        governor.available_mb = drifting
+        runner.run_job(self._brief(), when=self.NIGHT, log=self.log, notifier=n)
+        self.assertIn("4210", n.sent[0])
+        self.assertNotIn("6800", n.sent[0])
+
+    def test_gate_is_a_field_not_a_substring(self):
+        """The runner branches on Decision.gate, so rewording a reason must
+        never be able to silently disable the alert."""
+        j = self._brief()
+        s = governor.Settings(headroom_mb=1024)
+        self.assertEqual(governor.check_ram(j, s, avail_mb=10).gate, "ram")
+        self.assertEqual(
+            governor.check_window(j, self.NOON, s).gate, "window")
+        self.assertEqual(governor.admit(job(enabled=False)).gate, "enabled")
 
 
 class TestRunShell(unittest.TestCase):

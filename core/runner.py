@@ -28,10 +28,140 @@ import time
 import traceback
 from datetime import datetime, timezone
 
-from core import governor, registry
+from core import governor, paths, registry
 from core.job import Ctx, Job
 
 EXIT_OK, EXIT_FAILED, EXIT_TIMEOUT, EXIT_NOJOB = 0, 1, 2, 3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the RAM-skip alert
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The skip is correct and stays correct. CLAUDE.md section 3: a skipped run is
+# recoverable, an OOM-killed box at 3am is not. Nothing below changes a
+# decision, lowers a threshold, retries, or queues anything.
+#
+# What was wrong is that the skip was *silent*. `brief` needs 4,524 MiB free
+# (3500 + 1024 headroom) and the box has 7,815 MiB total, so one interactive
+# session left running overnight is enough to cross the line. When that
+# happens Nick gets no 05:40 message and no explanation -- and "no brief
+# arrived" is indistinguishable from "nothing happened". The mornings the
+# guard fires are exactly the mornings worth knowing about.
+#
+# Spine already owns the delivery path (core.notify -> hermes --deliver-only,
+# relayed verbatim, no agent invocation, no model cost), so this is a
+# notification on an existing branch rather than new infrastructure.
+
+# Stay quiet about the same job for this long after alerting once. The guard
+# can refuse on every tick of a frequent job, and an alert per tick is how a
+# Telegram channel gets muted -- at which point the one alert that mattered
+# goes unread too. Six hours clears by morning and can never stack overnight.
+ALERT_QUIET_S = 6 * 3600
+
+# Set SPINE_RAM_ALERT=0 to silence this without touching code. Present so the
+# answer to a noisy channel is a config line, not a patch that then has to be
+# remembered and reverted.
+ALERT_ENV = "SPINE_RAM_ALERT"
+
+
+def _alert_state_path() -> str:
+    """Where the throttle remembers its last send.
+
+    A small json file, not the item store. Same reasoning that took heartbeat
+    out of it (CLAUDE.md 7a): "the guard refused again" is infrastructure
+    telemetry, not something Nick acts on, and it must not take a slot in a
+    brief that shows the top 25 unacted items.
+    """
+    return paths.var("state", "ram_alerts.json")
+
+
+def _should_alert(job_id: str, now: float, path: str | None = None) -> bool:
+    """True at most once per ALERT_QUIET_S per job. Records the send.
+
+    Fails open: if the state file is unreadable we alert rather than stay
+    quiet, because a broken throttle should cost noise, not silence.
+    """
+    path = path or _alert_state_path()
+    try:
+        with open(path) as fh:
+            sent = json.load(fh)
+        if not isinstance(sent, dict):
+            sent = {}
+    except Exception:
+        sent = {}
+
+    last = sent.get(job_id)
+    if isinstance(last, (int, float)) and now - last < ALERT_QUIET_S:
+        return False
+
+    sent[job_id] = now
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(sent, fh, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+    return True
+
+
+def _alert_text(job: Job, decision: governor.Decision) -> str:
+    # decision.avail_mb, not a fresh read: the message must quote the figure
+    # the refusal was made on, or it can contradict the refusal it is
+    # reporting.
+    avail = decision.avail_mb
+    headroom = governor.Settings.from_env().headroom_mb
+    need = job.ram_required_mb(headroom)
+    return (
+        f"spine: {job.id} SKIPPED — not enough RAM\n\n"
+        f"needs {need} MB free ({job.ram_mb} + {need - job.ram_mb} headroom)\n"
+        f"had   {avail if avail is not None else '?'} MB at "
+        f"{_now()}\n\n"
+        "The guard refused rather than risk an OOM, which is the designed "
+        "behaviour — nothing swapped and nothing crashed. The run was skipped, "
+        "not queued, so it will not catch up later.\n\n"
+        "Most likely cause: an interactive session (VSCode, Copilot, Claude "
+        "Code) left running overnight. Closing it frees ~1.5-2.5 GB.\n\n"
+        "The item store is untouched — bin/items still has the queue."
+    )
+
+
+def _alert_ram_skip(job: Job, decision: governor.Decision, log,
+                    notifier=None) -> bool:
+    """Announce a RAM refusal. Best-effort, throttled, never raises.
+
+    Every failure path here is swallowed on purpose. A skip that could not be
+    announced is still a correct skip, and letting this raise would convert an
+    orderly refusal into a cron failure — the exact outcome the guard exists to
+    prevent. So the alert can fail; the skip cannot.
+    """
+    if os.environ.get(ALERT_ENV, "1").strip().lower() in ("0", "false", "no"):
+        log("ram alert suppressed", by=ALERT_ENV)
+        return False
+
+    try:
+        if notifier is None:
+            from core import notify as notify_mod
+            from core.job import _Secrets
+            notifier = notify_mod.Notifier(secrets=_Secrets(registry.root()))
+
+        if not notifier.configured():
+            # Not a failure to hide: delivery was never set up, and the skip
+            # is already in the log and the state file.
+            log("ram alert not sent", reason="delivery not configured")
+            return False
+
+        if not _should_alert(job.id, time.time()):
+            log("ram alert throttled",
+                quiet_for_s=ALERT_QUIET_S, job=job.id)
+            return False
+
+        notifier.send(_alert_text(job, decision))
+        log("ram alert sent", job=job.id)
+        return True
+    except Exception as exc:
+        log("ram alert FAILED", error=f"{type(exc).__name__}: {str(exc)[:160]}")
+        return False
 
 
 def _now() -> str:
@@ -57,8 +187,14 @@ def _alarm(_signum, _frame):
 
 
 def run_job(job: Job, *, dry_run: bool = False, force: bool = False,
-            when: datetime | None = None, log=None) -> tuple[int, dict]:
-    """Run one job. Always returns a state dict, even on failure."""
+            when: datetime | None = None, log=None,
+            notifier=None) -> tuple[int, dict]:
+    """Run one job. Always returns a state dict, even on failure.
+
+    `notifier` is injectable so the tests can exercise the RAM-skip alert
+    without a live hermes route — and, more importantly, without the suite
+    quietly sending Nick a Telegram message every time it runs.
+    """
     log = log or make_logger(job.id)
     when = when or datetime.now(timezone.utc)
     started = time.time()
@@ -79,7 +215,13 @@ def run_job(job: Job, *, dry_run: bool = False, force: bool = False,
     if not decision:
         log(f"SKIP  {decision.reason}")
         state.update(outcome="skipped", reason=decision.reason,
-                     finished_at=_now(), duration_s=0.0)
+                     gate=decision.gate, finished_at=_now(), duration_s=0.0)
+        # Only the RAM gate alerts. A window refusal is routine — a night job
+        # invoked at noon is bookkeeping, not news — and alerting on it would
+        # bury the one refusal that means a job Nick expected did not happen.
+        if decision.gate == "ram":
+            state["alerted"] = _alert_ram_skip(job, decision, log,
+                                               notifier=notifier)
         registry.write_state(job.id, state)
         return EXIT_OK, state
 

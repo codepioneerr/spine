@@ -40,8 +40,26 @@ DEFAULT_HEADROOM_MB = 1024
 
 @dataclass(frozen=True)
 class Decision:
+    """The verdict, plus which gate produced it.
+
+    `gate` is here so a caller can act on *why* it was refused without
+    pattern-matching the prose in `reason`. The runner needs that distinction:
+    a window refusal is routine bookkeeping (a night job invoked at noon), but
+    a RAM refusal means a job Nick expected simply did not happen, and those
+    two deserve very different treatment. Matching on reason text would make
+    every future reword of a message a silent behaviour change.
+
+    Defaulted so existing two-argument construction keeps working.
+    """
     ok: bool
     reason: str
+    gate: str = ""
+    # What the guard actually observed, carried so a caller reporting the
+    # refusal quotes the number the decision was MADE on. Re-reading
+    # /proc/meminfo a moment later can hand back a different figure, and an
+    # alert saying "had 5099 MB, needs 4524 MB" next to a refusal is worse
+    # than no alert — it reads as a bug in the guard.
+    avail_mb: int | None = None
 
     def __bool__(self) -> bool:
         return self.ok
@@ -128,23 +146,25 @@ def available_mb() -> int | None:
 
 def check_window(job, when: datetime, settings: Settings) -> Decision:
     if job.window == "any":
-        return Decision(True, "window=any")
+        return Decision(True, "window=any", gate="window")
 
     night = settings.is_night(when)
     local = settings.localize(when).strftime("%H:%M %Z")
 
     if job.window == "night":
         if night:
-            return Decision(True, f"night window, local {local}")
+            return Decision(True, f"night window, local {local}", gate="window")
         return Decision(
             False,
             f"outside night window ({settings.night_start:%H:%M}-"
-            f"{settings.night_end:%H:%M} local); now {local}")
+            f"{settings.night_end:%H:%M} local); now {local}",
+            gate="window")
 
     if night:
         return Decision(
-            False, f"day-window job, but it is night locally ({local})")
-    return Decision(True, f"day window, local {local}")
+            False, f"day-window job, but it is night locally ({local})",
+            gate="window")
+    return Decision(True, f"day window, local {local}", gate="window")
 
 
 def check_ram(job, settings: Settings, avail_mb: int | None = None) -> Decision:
@@ -152,15 +172,18 @@ def check_ram(job, settings: Settings, avail_mb: int | None = None) -> Decision:
     if avail is None:
         # No /proc: not the Dell. Do not block, but say so — silently
         # skipping the guard is how it gets forgotten.
-        return Decision(True, "RAM guard unavailable (no /proc); not enforced")
+        return Decision(True, "RAM guard unavailable (no /proc); not enforced",
+                        gate="ram")
 
     need = job.ram_required_mb(settings.headroom_mb)
     if avail >= need:
-        return Decision(True, f"{avail} MB free, needs {need} MB")
+        return Decision(True, f"{avail} MB free, needs {need} MB", gate="ram",
+                        avail_mb=avail)
     return Decision(
         False,
         f"insufficient RAM: {avail} MB free, needs {need} MB "
-        f"({job.ram_mb} + {need - job.ram_mb} headroom). Skipped, not queued.")
+        f"({job.ram_mb} + {need - job.ram_mb} headroom). Skipped, not queued.",
+        gate="ram", avail_mb=avail)
 
 
 def admit(job, when: datetime | None = None,
@@ -171,7 +194,7 @@ def admit(job, when: datetime | None = None,
     settings = settings or Settings.from_env()
 
     if not job.enabled:
-        return Decision(False, "disabled in META")
+        return Decision(False, "disabled in META", gate="enabled")
 
     win = check_window(job, when, settings)
     if not win:

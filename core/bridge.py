@@ -110,6 +110,29 @@ def table_exists(conn: sqlite3.Connection, name: str) -> bool:
         (name,)).fetchone() is not None
 
 
+def kv_get(name: str, key: str, default: str | None = None) -> str | None:
+    """One value out of a darkweb-jobs `kv` table, read-only.
+
+    darkweb-jobs records its own diagnostics there -- notably the ACRIS feed
+    verdict, which says whether a cursor that stopped moving means NYC paused
+    publishing or means the ingest is wedged. Spine reads that verdict instead
+    of re-deriving it, because re-deriving it would put a second Socrata client
+    in the repo that explicitly does not own fetching, and a second answer
+    available to disagree with the first.
+
+    Returns `default` when the table or the key is absent, which is the state
+    of every darkweb-jobs database that has not run the newer code yet.
+    """
+    conn = connect(name)
+    try:
+        if not table_exists(conn, "kv"):
+            return default
+        row = conn.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+        return row["v"] if row and row["v"] is not None else default
+    finally:
+        conn.close()
+
+
 def env_int(key: str, default: int) -> int:
     """An int from .env, falling back loudly rather than crashing a 06:30 run."""
     raw = os.environ.get(key)

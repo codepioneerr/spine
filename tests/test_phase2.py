@@ -265,7 +265,20 @@ class TestCollectorIntegration(unittest.TestCase):
         conn.commit()
         conn.close()
 
+        # run_job writes var/state/<job_id>.json, and these tests run the REAL
+        # acris and heartbeat jobs — so without this the suite overwrites the
+        # operational state that bin/status and bin/darkweb display, and the
+        # console shows a synthetic run from whenever the tests last ran.
+        # state_dir() is derived from the checkout and deliberately not
+        # configurable (core.paths), which is the right call for production and
+        # exactly why the redirect belongs here instead of in an env var.
+        from core import registry
+        self._write_state = registry.write_state
+        registry.write_state = lambda job_id, data: None
+
     def tearDown(self):
+        from core import registry
+        registry.write_state = self._write_state
         os.environ.clear()
         os.environ.update(self._old)
         self._dir.cleanup()
