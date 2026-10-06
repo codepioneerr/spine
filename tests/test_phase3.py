@@ -432,5 +432,154 @@ class TestAcrisEnrichment(Phase3Case):
         self.assertIn("not yet looked up", items[0]["body"])
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# condo unit lots, and the ACRIS staleness alert
+
+UNIT = "3023101001"          # a condo unit
+BASE = "3023100037"          # the lot the condo sits on
+BILLING = "3023107501"       # the lot PLUTO files it under
+
+
+class CondoHttp:
+    """Digital Tax Map + PLUTO stand-in, dispatched on URL."""
+
+    def __init__(self, fail_condos=False):
+        self.fail_condos = fail_condos
+        self.urls = []
+
+    def get_json(self, url, params=None, headers=None, timeout=None):
+        self.urls.append(url)
+        where = params["$where"]
+        keys = [k.strip("'") for k in
+                where[where.index("(") + 1:where.index(")")].split(",")]
+        if url == collector.CONDO_UNITS_URL:
+            if self.fail_condos:
+                raise HttpError("HTTP 503", status=503)
+            return [{"unit_bbl": k, "condo_base_bbl": BASE,
+                     "condo_key": "300973"} for k in keys if k == UNIT]
+        if url == collector.CONDOS_URL:
+            return [{"condo_key": "300973", "condo_billing_bbl": BILLING}]
+        return [pluto_rec(k, "103 NORTH 8 STREET")
+                for k in keys if k == BILLING]
+
+
+class TestCondoUnits(Phase3Case):
+
+    def test_is_unit_lot(self):
+        self.assertTrue(proptech.is_unit_lot(UNIT))
+        self.assertTrue(proptech.is_unit_lot("1000046999"))
+        self.assertFalse(proptech.is_unit_lot(BILLING))
+        self.assertFalse(proptech.is_unit_lot("4000010001"))
+        self.assertFalse(proptech.is_unit_lot(None))
+
+    def test_unit_resolves_to_its_buildings_pluto_facts(self):
+        self.doc(2_000_000, bbls=(UNIT,))
+        http = CondoHttp()
+        self.run_collector(http)
+        c = self.spine()
+        try:
+            row = c.execute("SELECT * FROM condo_lots").fetchone()
+            self.assertEqual((row["unit_bbl"], row["base_bbl"],
+                              row["billing_bbl"]), (UNIT, BASE, BILLING))
+            got = proptech.parcels_for(c, [UNIT])
+            self.assertEqual(got[UNIT]["address"], "103 NORTH 8 STREET")
+            self.assertEqual(proptech.counts(c)["pluto_coverage_pct"], 100.0)
+        finally:
+            c.close()
+
+    def test_unit_is_not_asked_of_pluto_directly(self):
+        self.doc(2_000_000, bbls=(UNIT,))
+        http = CondoHttp()
+        self.run_collector(http)
+        c = self.spine()
+        try:
+            self.assertIsNone(c.execute(
+                "SELECT 1 FROM parcels WHERE bbl=?", (UNIT,)).fetchone())
+        finally:
+            c.close()
+
+    def test_unknown_unit_is_remembered_not_reasked(self):
+        self.doc(2_000_000, bbls=("3023101002",))
+        http = CondoHttp()
+        self.run_collector(http)
+        n = len(http.urls)
+        self.run_collector(http)
+        self.assertEqual(len(http.urls), n)
+        c = self.spine()
+        try:
+            self.assertIsNone(c.execute(
+                "SELECT billing_bbl FROM condo_lots").fetchone()[0])
+        finally:
+            c.close()
+
+    def test_failed_condo_batch_marks_nothing(self):
+        self.doc(2_000_000, bbls=(UNIT,))
+        self.run_collector(CondoHttp(fail_condos=True))
+        c = self.spine()
+        try:
+            self.assertEqual(
+                c.execute("SELECT COUNT(*) FROM condo_lots").fetchone()[0], 0)
+        finally:
+            c.close()
+        self.run_collector(CondoHttp())
+        c = self.spine()
+        try:
+            self.assertEqual(c.execute(
+                "SELECT billing_bbl FROM condo_lots").fetchone()[0], BILLING)
+        finally:
+            c.close()
+
+    def test_acris_deed_on_a_unit_gets_its_building(self):
+        self.doc(6_000_000, bbls=(UNIT,))
+        self.run_collector(CondoHttp())
+        rows = [{"document_id": "X", "doc_type": "DEED", "document_amt": 6e6,
+                 "recorded_datetime": "2026-10-01", "bbl": UNIT,
+                 "borough": "3", "street_number": "N/A", "street_name": "",
+                 "unit": "", "address": None, "zipcode": None,
+                 "bldgclass": None, "zonedist1": None, "unitsres": None,
+                 "unitstotal": None, "yearbuilt": None, "bldgarea": None,
+                 "assesstot": None, "ownername": None}]
+        c = self.spine()
+        try:
+            parcels = proptech.parcels_for(c, [UNIT])
+        finally:
+            c.close()
+        it = acris.build_items(rows, parcels)[0]
+        self.assertEqual(it["data"]["address"], "103 NORTH 8 STREET")
+
+
+class TestAcrisStaleness(unittest.TestCase):
+    NOW = datetime(2026, 10, 6, 6, 30, tzinfo=UTC)
+
+    def test_fresh_feed_is_quiet(self):
+        self.assertIsNone(acris.staleness_item(
+            "2026-10-01T00:00:00.000", self.NOW, 7))
+
+    def test_exactly_at_threshold_is_quiet(self):
+        self.assertIsNone(acris.staleness_item(
+            "2026-09-29T00:00:00.000", self.NOW, 7))
+
+    def test_frozen_feed_alerts_above_interrupt(self):
+        it = acris.staleness_item("2026-08-31T00:00:00.000", self.NOW, 7)
+        self.assertEqual(it["kind"], "alert")
+        self.assertEqual(it["key"], "feed-stale:2026-08-31")
+        self.assertGreaterEqual(it["importance"], 80)
+        self.assertEqual(it["data"]["age_days"], 36)
+
+    def test_key_is_stable_while_frozen_and_new_after_a_thaw(self):
+        a = acris.staleness_item("2026-08-31", self.NOW, 7)
+        b = acris.staleness_item("2026-08-31", self.NOW + timedelta(days=1), 7)
+        c = acris.staleness_item("2026-09-10", self.NOW + timedelta(days=30), 7)
+        self.assertEqual(a["key"], b["key"])
+        self.assertNotEqual(a["key"], c["key"])
+
+    def test_empty_table_alerts(self):
+        self.assertEqual(acris.staleness_item(None, self.NOW, 7)["key"],
+                         "feed-stale:empty")
+
+    def test_garbage_date_does_not_crash(self):
+        self.assertIsNone(acris.staleness_item("not-a-date", self.NOW, 7))
+
+
 if __name__ == "__main__":
     unittest.main()

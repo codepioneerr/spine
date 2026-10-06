@@ -56,6 +56,12 @@ META = {
 }
 
 PLUTO_URL = "https://data.cityofnewyork.us/resource/64uk-42ks.json"
+# Digital Tax Map: condo units (unit_bbl -> condo_key) and condos
+# (condo_key -> condo_billing_bbl, the lot PLUTO files the building under).
+# Both store BBLs as text, so the $where values are quoted.
+CONDO_UNITS_URL = "https://data.cityofnewyork.us/resource/eguu-7ie3.json"
+CONDOS_URL = "https://data.cityofnewyork.us/resource/p8u6-a6it.json"
+DEFAULT_CONDO_MAX = 1000
 
 # Socrata accepts long $where clauses, but 50 keys per request keeps each URL
 # well under proxy limits and makes one failed request cost little.
@@ -189,6 +195,58 @@ def fetch_pluto(http, bbls: list[str], app_token: str | None = None,
     return found, absent, failures
 
 
+def fetch_condo_lots(http, unit_bbls: list[str], app_token: str | None = None,
+                     log=lambda *_: None) -> tuple[list[dict], list[str], int]:
+    """Map condo unit BBLs to their base and billing lots. Returns (mapped
+    rows, unmapped unit bbls, failures).
+
+    Two lookups per batch: unit -> condo_key, then condo_key -> billing lot.
+    As with fetch_pluto, a unit is only called unmapped when its batch
+    succeeded and the Digital Tax Map did not list it; if either request
+    fails, the batch's units are left alone to be asked again."""
+    headers = {"X-App-Token": app_token} if app_token else None
+    mapped: list[dict] = []
+    unmapped: list[str] = []
+    failures = streak = 0
+
+    def ask(url, select, field, keys):
+        where = f"{field} in ({','.join(repr(k) for k in keys)})"
+        return http.get_json(url, params={
+            "$select": select, "$where": where,
+            "$limit": str(len(keys) * 2)}, headers=headers)
+
+    for i in range(0, len(unit_bbls), PLUTO_BATCH):
+        batch = unit_bbls[i:i + PLUTO_BATCH]
+        try:
+            units = [r for r in ask(CONDO_UNITS_URL,
+                                    "unit_bbl,condo_base_bbl,condo_key",
+                                    "unit_bbl", batch) if isinstance(r, dict)]
+            keys = sorted({r["condo_key"] for r in units if r.get("condo_key")})
+            condos = ask(CONDOS_URL, "condo_key,condo_billing_bbl",
+                         "condo_key", keys) if keys else []
+        except HttpError as exc:
+            failures += 1
+            streak += 1
+            log(f"proptech: condo batch {i // PLUTO_BATCH} failed: {exc}")
+            if streak >= MAX_CONSECUTIVE_FAILURES:
+                log("proptech: condo datasets look down; stopping lookups")
+                break
+            continue
+        streak = 0
+        billing = {c.get("condo_key"): proptech.normalize_bbl(
+            c.get("condo_billing_bbl")) for c in condos if isinstance(c, dict)}
+        got = set()
+        for r in units:
+            u = proptech.normalize_bbl(r.get("unit_bbl"))
+            b = billing.get(r.get("condo_key"))
+            if u and b:
+                got.add(u)
+                mapped.append({"unit_bbl": u, "billing_bbl": b,
+                               "base_bbl": r.get("condo_base_bbl")})
+        unmapped += [b for b in batch if b not in got]
+    return mapped, unmapped, failures
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # step 3: repeat-sale items
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,10 +341,24 @@ def run(ctx):
         kept = proptech.upsert_docs(conn, docs)
         proptech.upsert_parcels(conn, slice_rows, origin="dwj")
 
+        token = ctx.secrets.get("SPINE_SOCRATA_APP_TOKEN") if ctx.secrets else None
+        condo_max = bridge.env_int("SPINE_CONDO_FETCH_MAX", DEFAULT_CONDO_MAX)
+        units = proptech.units_needing_map(conn, condo_max, now=ctx.now)
+        mapped, unmapped, condo_failures = [], [], 0
+        if units and not ctx.dry_run:
+            mapped, unmapped, condo_failures = fetch_condo_lots(
+                ctx.http, units, token, ctx.log)
+            proptech.upsert_condo_lots(conn, mapped)
+            proptech.mark_unmapped(conn, unmapped)
+        ctx.log(f"proptech: condo units {len(units)} asked, {len(mapped)} "
+                f"mapped, {len(unmapped)} unmapped, {condo_failures} failed "
+                f"batch(es)")
+
         todo = proptech.bbls_needing_pluto(conn, pluto_max, now=ctx.now)
+        todo += [b for b in proptech.billing_needing_pluto(
+            conn, pluto_max, now=ctx.now) if b not in todo]
         found, absent, failures = [], [], 0
         if todo and not ctx.dry_run:
-            token = ctx.secrets.get("SPINE_SOCRATA_APP_TOKEN") if ctx.secrets else None
             found, absent, failures = fetch_pluto(ctx.http, todo, token, ctx.log)
             proptech.upsert_parcels(conn, found, origin="pluto")
             proptech.mark_absent(conn, absent)
@@ -300,6 +372,8 @@ def run(ctx):
         items = build_items(sales, parcels)
         stats = {**kept, "pluto_asked": len(todo), "pluto_found": len(found),
                  "pluto_absent": len(absent), "pluto_failed_batches": failures,
+                 "condo_asked": len(units), "condo_mapped": len(mapped),
+                 "condo_failed_batches": condo_failures,
                  "repeat_sales": len(sales), **proptech.counts(conn)}
     finally:
         conn.close()

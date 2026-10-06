@@ -31,6 +31,8 @@ fact reaches a logging endpoint.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from core import bridge, proptech
 
 META = {
@@ -255,6 +257,47 @@ def build_items(rows, parcels: dict | None = None) -> list[dict]:
     return items
 
 
+# The city publishes ACRIS in batches and has gone quiet for weeks before (the
+# newest record sat at 2026-08-31 on Oct 6), so "no new deeds" is not always
+# a slow week. Seven days covers a long weekend plus a late batch.
+DEFAULT_STALE_DAYS = 7
+
+
+def staleness_item(newest: str | None, now, stale_days: int):
+    """An alert item when the newest recorded date is more than `stale_days`
+    old, else None. Pure.
+
+    The key carries the frozen date: one alert per freeze, not one per night.
+    The store keeps the first-seen time and any dismissal, so a feed that
+    stays frozen does not re-nag; when it thaws and later freezes again, the
+    newest date differs and it is a new alert.
+    """
+    if not newest:
+        age, day = None, "empty"
+    else:
+        day = str(newest)[:10]
+        try:
+            age = (now.date() - datetime.strptime(day, "%Y-%m-%d").date()).days
+        except ValueError:
+            return None
+        if age <= stale_days:
+            return None
+    since = f"{age} days" if age is not None else "ever"
+    return {
+        "kind": "alert",
+        "key": f"feed-stale:{day}",
+        "title": f"ACRIS feed stale — newest record {day}",
+        "body": (f"No new ACRIS records for {since} (threshold "
+                 f"{stale_days}). Deeds and repeat-sale signals are not "
+                 "arriving; check darkweb-jobs' proptech fetch and the "
+                 "city's dataset before trusting a quiet brief."),
+        "url": "https://data.cityofnewyork.us/resource/bnx9-e6tj.json",
+        "importance": 85,
+        "data": {"newest_recorded": newest, "age_days": age,
+                 "stale_days": stale_days},
+    }
+
+
 def run(ctx):
     min_amount = bridge.env_int("SPINE_PROPTECH_MIN_AMOUNT",
                                 DEFAULT_MIN_AMOUNT)
@@ -265,6 +308,8 @@ def run(ctx):
     conn = bridge.connect("proptech")
     try:
         rows = select(conn, since, min_amount)
+        newest = conn.execute(
+            "SELECT MAX(recorded_datetime) FROM acris_master").fetchone()[0]
     finally:
         conn.close()
 
@@ -283,6 +328,11 @@ def run(ctx):
         except Exception as exc:                           # noqa: BLE001
             ctx.log(f"acris: parcel enrichment skipped: {exc}")
     items = build_items(rows, parcels)
+    stale = staleness_item(newest, ctx.now, bridge.env_int(
+        "SPINE_ACRIS_STALE_DAYS", DEFAULT_STALE_DAYS))
+    if stale:
+        ctx.log(f"acris: FEED STALE — {stale['title']}")
+        items.append(stale)
     ctx.log(f"acris: {len(rows)} joined row(s) -> {len(items)} document(s)")
 
     if ctx.dry_run:

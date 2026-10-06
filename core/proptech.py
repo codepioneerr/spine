@@ -40,7 +40,16 @@ data, budgeted per run, with no cursor to keep and nothing to retire.
 A BBL PLUTO does not have is remembered as `absent` and not asked about
 again for ABSENT_RETRY_DAYS. Most of those are condominium unit lots
 (lot 1001+), which ACRIS records per unit and PLUTO rolls up under a
-billing lot; mapping them needs a different dataset and is not done here.
+billing lot. Those are mapped through the Digital Tax Map condo datasets
+into `condo_lots` (below), so a unit's facts are its building's.
+
+## Condo unit lots
+
+A unit is recorded as e.g. 3023101001. PLUTO has no such lot: it carries the
+condo once, under the *billing* lot (75xx, here 3023107501), not under the
+*base* lot (3023100037, the lot the condo sits on) either. `condo_lots` keeps
+all three: unit -> base -> billing. `parcels_for` resolves a unit to its
+billing parcel, so callers keep asking by the BBL ACRIS gave them.
 """
 
 from __future__ import annotations
@@ -96,6 +105,16 @@ CREATE TABLE IF NOT EXISTS parcels (
     assesstot REAL, ownername TEXT, latitude REAL, longitude REAL,
     fetched_ts TEXT NOT NULL
 );
+
+-- billing_bbl NULL means the Digital Tax Map had no such unit; retried after
+-- ABSENT_RETRY_DAYS, like an absent parcel.
+CREATE TABLE IF NOT EXISTS condo_lots (
+    unit_bbl    TEXT PRIMARY KEY,
+    base_bbl    TEXT,
+    billing_bbl TEXT,
+    fetched_ts  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_condo_lots_billing ON condo_lots(billing_bbl);
 """
 
 
@@ -136,6 +155,13 @@ def normalize_bbl(raw) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 # writes
 # ─────────────────────────────────────────────────────────────────────────────
+
+def is_unit_lot(bbl) -> bool:
+    """A condominium unit lot: tax lot 1001-6999. Billing lots (7501-7599) are
+    the PLUTO-side lot and are not units."""
+    b = normalize_bbl(bbl)
+    return bool(b) and 1001 <= int(b[6:]) <= 6999
+
 
 def upsert_docs(conn, rows) -> dict:
     """rows: dicts/Rows with document_id, doc_type, document_date,
@@ -210,6 +236,63 @@ def mark_absent(conn, bbls) -> int:
 # reads
 # ─────────────────────────────────────────────────────────────────────────────
 
+def upsert_condo_lots(conn, rows) -> int:
+    """rows: dicts with unit_bbl, base_bbl, billing_bbl."""
+    now = _now()
+    vals = [(u, normalize_bbl(r.get("base_bbl")),
+             normalize_bbl(r.get("billing_bbl")), now)
+            for r in rows if (u := normalize_bbl(r.get("unit_bbl")))]
+    with conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO condo_lots VALUES (?,?,?,?)", vals)
+    return len(vals)
+
+
+def mark_unmapped(conn, unit_bbls) -> int:
+    now = _now()
+    with conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO condo_lots VALUES (?, NULL, NULL, ?)",
+            [(b, now) for b in unit_bbls])
+    return len(unit_bbls)
+
+
+def _retry_cutoff(now) -> str:
+    now = now or datetime.now(timezone.utc)
+    return (now - timedelta(days=ABSENT_RETRY_DAYS)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def units_needing_map(conn, limit: int, now: datetime | None = None) -> list[str]:
+    """Unit lots on a kept document with no mapping yet (or an unmapped one
+    due a retry), largest deal first."""
+    rows = conn.execute(
+        """SELECT l.bbl, MAX(d.amount) AS top
+             FROM acris_doc_parcels l
+             JOIN acris_docs d USING (document_id)
+             LEFT JOIN condo_lots c ON c.unit_bbl = l.bbl
+            WHERE CAST(SUBSTR(l.bbl, 7, 4) AS INTEGER) BETWEEN 1001 AND 6999
+              AND (c.unit_bbl IS NULL
+                   OR (c.billing_bbl IS NULL AND c.fetched_ts < ?))
+            GROUP BY l.bbl
+            ORDER BY top DESC
+            LIMIT ?""", (_retry_cutoff(now), limit)).fetchall()
+    return [r["bbl"] for r in rows]
+
+
+def billing_needing_pluto(conn, limit: int, now: datetime | None = None) -> list[str]:
+    """Billing lots of mapped condos that have no PLUTO facts yet."""
+    rows = conn.execute(
+        """SELECT DISTINCT c.billing_bbl
+             FROM condo_lots c
+             LEFT JOIN parcels p ON p.bbl = c.billing_bbl
+            WHERE c.billing_bbl IS NOT NULL
+              AND (p.bbl IS NULL
+                   OR (p.origin = 'absent' AND p.fetched_ts < ?))
+            LIMIT ?""", (_retry_cutoff(now), limit)).fetchall()
+    return [r["billing_bbl"] for r in rows]
+
+
 def bbls_needing_pluto(conn, limit: int, now: datetime | None = None) -> list[str]:
     """Parcels on a kept document with no PLUTO facts yet, largest deal first,
     so a capped run spends its budget where the brief will look."""
@@ -221,8 +304,9 @@ def bbls_needing_pluto(conn, limit: int, now: datetime | None = None) -> list[st
              FROM acris_doc_parcels l
              JOIN acris_docs d USING (document_id)
              LEFT JOIN parcels p ON p.bbl = l.bbl
-            WHERE p.bbl IS NULL
-               OR (p.origin = 'absent' AND p.fetched_ts < ?)
+            WHERE (p.bbl IS NULL
+                   OR (p.origin = 'absent' AND p.fetched_ts < ?))
+              AND CAST(SUBSTR(l.bbl, 7, 4) AS INTEGER) NOT BETWEEN 1001 AND 6999
             GROUP BY l.bbl
             ORDER BY top DESC
             LIMIT ?""", (retry, limit)).fetchall()
@@ -239,6 +323,18 @@ def parcels_for(conn, bbls) -> dict[str, dict]:
                 f"SELECT * FROM parcels WHERE origin != 'absent' AND bbl IN "
                 f"({','.join('?' * len(chunk))})", chunk):
             out[r["bbl"]] = dict(r)
+    # A condo unit has no PLUTO row of its own: answer with its building's,
+    # under the unit BBL the caller asked about.
+    units = [b for b in bbls if b not in out and is_unit_lot(b)]
+    for i in range(0, len(units), 500):
+        chunk = units[i:i + 500]
+        for r in conn.execute(
+                f"SELECT c.unit_bbl AS _unit, p.* FROM condo_lots c "
+                f"JOIN parcels p ON p.bbl = c.billing_bbl "
+                f"WHERE p.origin != 'absent' AND c.unit_bbl IN "
+                f"({','.join('?' * len(chunk))})", chunk):
+            d = dict(r)
+            out[d.pop("_unit")] = d
     return out
 
 
@@ -307,7 +403,14 @@ def counts(conn) -> dict:
         "SELECT COUNT(DISTINCT bbl) FROM acris_doc_parcels").fetchone()[0]
     known = conn.execute(
         """SELECT COUNT(DISTINCT l.bbl) FROM acris_doc_parcels l
-             JOIN parcels p ON p.bbl = l.bbl AND p.origin != 'absent'"""
+            WHERE EXISTS (SELECT 1 FROM parcels p
+                           WHERE p.bbl = l.bbl AND p.origin != 'absent')
+               OR EXISTS (SELECT 1 FROM condo_lots c
+                            JOIN parcels p ON p.bbl = c.billing_bbl
+                           WHERE c.unit_bbl = l.bbl AND p.origin != 'absent')"""
+    ).fetchone()[0]
+    c["condo_units_mapped"] = conn.execute(
+        "SELECT COUNT(*) FROM condo_lots WHERE billing_bbl IS NOT NULL"
     ).fetchone()[0]
     c["parcels_linked"] = linked
     c["pluto_coverage_pct"] = round(100 * known / linked, 1) if linked else 0.0
