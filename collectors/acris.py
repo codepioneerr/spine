@@ -152,12 +152,19 @@ def address_of(row) -> str:
     return line.strip() or (row["bbl"] or "unknown address")
 
 
+# Plain words in the title. "MTGE $42M" read as a deal to someone new to
+# ACRIS; it is a loan amount (core.property_facts holds the full meanings).
+SHORT_TYPE = {"DEED": "Deed (ownership transfer)", "DEEDO": "Deed-other",
+              "MTGE": "Mortgage (loan, not a sale)"}
+
+
 def title_of(row) -> str:
     amt = row["document_amt"]
     money = f"${amt:,.0f}" if amt else "amount n/a"
     boro = BOROUGHS.get(str(row["borough"]), "")
     where = address_of(row)
-    return f"{row['doc_type']} {money} — {where}{', ' + boro if boro else ''}"
+    kind = SHORT_TYPE.get(row["doc_type"], row["doc_type"])
+    return f"{kind} {money} — {where}{', ' + boro if boro else ''}"
 
 
 def body_of(row) -> str:

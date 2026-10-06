@@ -1,0 +1,23 @@
+# Spine Telegram assistant (long polling). NOT installed by default.
+# Install (after review):
+#   cp deploy/spine-assist.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now spine-assist
+# Token and allowed id come from the repo .env (mode 600):
+#   SPINE_ASSIST_BOT_TOKEN=...   SPINE_ASSIST_ALLOWED_ID=...
+[Unit]
+Description=Spine Telegram assistant (inbound questions, cards, scheduled brief)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pioneer/projects/spine
+ExecStart=/usr/bin/python3 -m surfaces.bot
+Restart=on-failure
+RestartSec=15
+RestartPreventExitStatus=78
+MemoryMax=128M
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

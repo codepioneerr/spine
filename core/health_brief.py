@@ -159,13 +159,15 @@ def _fmt(v, units=""):
 
 
 def _vs(today, base):
-    if today is None or not base:
+    # Fewer than 5 prior days is not a baseline; "+600% vs a 1-day average"
+    # is noise presented as a finding.
+    if today is None or not base or len(base) < 5:
         return ""
     avg = sum(base) / len(base)
     if not avg:
         return ""
     pct = 100 * (today - avg) / abs(avg)
-    return f" (14d avg {_fmt(avg)}, {pct:+.0f}%)"
+    return f" (14d avg {_fmt(avg)} over {len(base)} days, {pct:+.0f}%)"
 
 
 def _pearson(xs, ys):

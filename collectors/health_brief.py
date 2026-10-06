@@ -89,7 +89,9 @@ def run(ctx):
         if ok:
             note = plan(ctx, text)
         else:
-            text += f"\n\n-- plan skipped: {free} MB free, needs {need} MB --"
+            # A RAM shortfall is an operator fact, not health information: it
+            # goes to the log and the bot's /status, never into the brief.
+            ctx.log("plan skipped", reason="insufficient RAM", free_mb=free, need_mb=need)
     if note:
         text += "\n\n-- today's plan (local model, unverified; not medical advice) --\n" + note
 
