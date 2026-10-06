@@ -461,9 +461,12 @@ def mobility(confirmed=None) -> Reply:
                           ("Add mobility to brief", "focus_propose", "mobility")])
 
 
-def workout(plan_id="strength15", confirmed=None) -> Reply:
-    text = workouts.render(plan_id, workouts.profile_notes(confirmed or {}, plan_id))
-    return Reply(text, domain="health", ref={"kind": "workout", "plan": plan_id},
+def workout(plan_id="strength15", confirmed=None, minutes=None) -> Reply:
+    text = workouts.render(plan_id, workouts.profile_notes(confirmed or {}, plan_id), minutes)
+    ref = {"kind": "workout", "plan": plan_id}
+    if minutes:
+        ref["minutes"] = minutes
+    return Reply(text, domain="health", ref=ref,
                  actions=[("Done", "fb", "done"), ("Too easy", "fb", "easy"),
                           ("Too hard", "fb", "hard"), ("Skip", "fb", "skip"),
                           ("Shorter version", "w_short", plan_id), ("My profile", "profile", "")])

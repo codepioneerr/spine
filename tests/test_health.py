@@ -237,6 +237,19 @@ class TestStreams(unittest.TestCase):
                      ("state_of_mind", 1), ("sleep_sessions", 1)):
             self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0], n, t)
 
+    def test_stage_segments_crossing_midnight_are_one_night(self):
+        segs = [("2026-10-05 23:00:00 -0400", "2026-10-05 23:50:00 -0400", "Core"),
+                ("2026-10-05 23:50:00 -0400", "2026-10-06 00:30:00 -0400", "Deep"),
+                ("2026-10-06 00:30:00 -0400", "2026-10-06 01:10:00 -0400", "REM"),
+                ("2026-10-06 01:10:00 -0400", "2026-10-06 01:20:00 -0400", "Awake")]
+        p = {"data": {"metrics": [{"name": "sleep_analysis", "data": [
+            {"startDate": s, "endDate": t, "value": v} for s, t, v in segs]}]}}
+        for _ in range(2):
+            health.ingest(p, self.conn)
+        rows = self.conn.execute("SELECT start_time, total_sleep_minutes, awake_minutes "
+                                 "FROM sleep_sessions").fetchall()
+        self.assertEqual(rows, [("2026-10-05T23:00:00-04:00", 130.0, 10.0)])
+
     def test_garbage_records_never_raise(self):
         junk = {"data": {"metrics": [None, 5, {"name": "x", "data": "no"},
                                      {"name": "y", "data": [None, {"date": "bad"}]}],
