@@ -23,6 +23,7 @@ import hmac
 import json
 import os
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from core import health, paths
@@ -129,17 +130,22 @@ def serve(host: str | None = None, port: int | None = None):
     token = load_token()
     if not token:
         sys.exit("health_receiver: SPINE_HEALTH_TOKEN is not set (env or .env); refusing to start")
-    host = host or os.environ.get("SPINE_HEALTH_BIND", "0.0.0.0")
+    # Comma-separated, e.g. "127.0.0.1,100.x.y.z": loopback plus Tailscale only.
+    hosts = [h.strip() for h in (host or os.environ.get("SPINE_HEALTH_BIND", "0.0.0.0")).split(",") if h.strip()]
     port = port or int(os.environ.get("SPINE_HEALTH_PORT", "8123"))
     health.connect().close()  # initialise var/health.db before the first sync
-    httpd = HTTPServer((host, port), make_handler(token))
-    sys.stderr.write(f"health_receiver: listening on {host}:{port}{ROUTE}\n")
+    servers = [HTTPServer((h, port), make_handler(token)) for h in hosts]
+    for h in hosts:
+        sys.stderr.write(f"health_receiver: listening on {h}:{port}{ROUTE}\n")
+    for extra in servers[1:]:
+        threading.Thread(target=extra.serve_forever, daemon=True).start()
     try:
-        httpd.serve_forever()
+        servers[0].serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        httpd.server_close()
+        for s in servers:
+            s.server_close()
 
 
 if __name__ == "__main__":
