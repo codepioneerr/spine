@@ -325,6 +325,16 @@ answers a unit BBL with that building's facts. `acris` also emits a
 Nothing surfaces until its level backtests under 25% MdAPE
 (`surfaceable()`); keep it that way until the error drops.
 
+**Residential AVM benchmark (Oct 6).** `eval/score_avm.py` is the frozen
+scorer and `eval/build_benchmark.py` builds its benchmark into
+`var/avm_benchmark/` (DOF sale price as truth, ACRIS for hygiene only,
+4 boroughs, condo units + 1–3 family, 90-day test window ending 45 days
+before the newest ACRIS recording). It is the trust boundary for any
+automated optimisation loop: **workers never edit `eval/` or
+`var/avm_benchmark/`**, and promoting `baseline_metrics.json` is a human
+act. First build: 6,219 test sales; a zip+class median scores 22.7% MdAPE.
+The build peaks near 480 MB — run it by hand, not as a daytime job.
+
 **The brief and RAM (Oct 6).** `brief` is a light job. Its model step
 (qwen3.5:4b, ~3.6 GB resident) checks 3500 MB + headroom itself, retries
 3× 60 s apart, and is skipped with a note if RAM never frees — the brief is
