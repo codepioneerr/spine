@@ -45,7 +45,7 @@ correct once the brief is real — flagged for review rather than assumed.
 
 from __future__ import annotations
 
-from core import bridge
+from core import bridge, freshness
 
 META = {
     "id": "eventbot",
@@ -170,17 +170,28 @@ def build_items(rows) -> list[dict]:
     return items
 
 
+# The darkweb-jobs writer ticks far more often than this; see core.freshness.
+STALE_HOURS = 1
+
+
 def run(ctx):
     since = bridge.since_iso(LOOKBACK_HOURS, now=ctx.now)
     ctx.log(f"eventbot: reading positions open or touched since {since}")
 
     conn = bridge.connect("eventbot")
     try:
+        newest = conn.execute("SELECT MAX(ts) FROM equity_log").fetchone()[0]
         rows = select(conn, since)
     finally:
         conn.close()
 
     items = build_items(rows)
+    stale = freshness.stale_item(
+        "eventbot", newest, ctx.now,
+        bridge.env_int("SPINE_EVENTBOT_STALE_HOURS", STALE_HOURS), "eventbot tick")
+    if stale:
+        ctx.log(f"eventbot: FEED STALE — {stale['title']}")
+        items.append(stale)
     n_open = sum(1 for r in rows if r["status"] == "open")
     ctx.log(f"eventbot: {len(items)} position(s), {n_open} open")
 

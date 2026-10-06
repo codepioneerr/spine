@@ -26,7 +26,7 @@ Polymarket prices are public market data. Nothing here is Nick's.
 
 from __future__ import annotations
 
-from core import bridge
+from core import bridge, freshness
 
 META = {
     "id": "polymarket",
@@ -136,6 +136,10 @@ def build_items(rows) -> list[dict]:
     return items
 
 
+# The darkweb-jobs writer ticks far more often than this; see core.freshness.
+STALE_HOURS = 3
+
+
 def run(ctx):
     min_volume = bridge.env_int("SPINE_POLYMARKET_MIN_VOLUME",
                                 DEFAULT_MIN_VOLUME)
@@ -145,11 +149,18 @@ def run(ctx):
 
     conn = bridge.connect("prediction")
     try:
+        newest = conn.execute("SELECT MAX(ts) FROM snapshots").fetchone()[0]
         rows = select(conn, since, min_volume)
     finally:
         conn.close()
 
     items = build_items(rows)
+    stale = freshness.stale_item(
+        "polymarket", newest, ctx.now,
+        bridge.env_int("SPINE_POLYMARKET_STALE_HOURS", STALE_HOURS), "market snapshot")
+    if stale:
+        ctx.log(f"polymarket: FEED STALE — {stale['title']}")
+        items.append(stale)
     ctx.log(f"polymarket: {len(items)} jump(s)")
 
     if ctx.dry_run:
