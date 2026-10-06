@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+#
+# bin/proptech-report — did last night's acris/proptech/brief runs work?
+# Read-only; see core/morning_report.py.
+#
+cd "$(dirname "${BASH_SOURCE[0]}")/.." && exec python3 -m core.morning_report "$@"
