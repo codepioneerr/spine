@@ -63,6 +63,7 @@ def log(event, **kw):
 class Assistant:
     def __init__(self, bot: Bot, store: Store, allowed_id: int, now=None):
         self.bot, self.store, self.allowed = bot, store, int(allowed_id)
+        self.research_opener = None          # tests inject a fake fetcher
         self._now = now
 
     def now(self):
@@ -199,6 +200,8 @@ class Assistant:
 
     def on_text(self, chat, text):
         intent = router.route(text)
+        if router.novel(text, intent):
+            intent = "unknown"
         self.store.tel("intent", detail=intent)
         if intent == "sexual":
             return self.emit(chat, A.sexual_health())
@@ -236,10 +239,12 @@ class Assistant:
             return self.emit(chat, daily.build(self.store, self.now()))
         if intent == "privacy":
             return self.emit(chat, A.privacy_reply())
-        self.store.add_research(text)
-        return self.bot.send(chat, "I don't have a vetted answer for that yet, so I won't guess. "
-                                   "I saved the question locally for research. Meanwhile: /help "
-                                   "lists what I can answer from your data.")
+        r = A.research_answer(text, self.store.conn, online=self.store.pref("research_online"),
+                              now=self.now(), opener=self.research_opener)
+        if (r.ref or {}).get("status") is not None or not r.links:
+            self.store.add_research(text)
+        self.store.tel("research", ok=bool(r.links))
+        return self.emit(chat, r)
 
     # ── property / focus / settings ────────────────────────────────
     def send_property(self, chat):
@@ -308,6 +313,9 @@ class Assistant:
         elif a[:1] == ["mode"] and len(a) >= 2 and a[1] in ("compact", "detailed"):
             s.set_pref("mode", a[1])
             msg = f"Brief mode: {a[1]}."
+        elif a[:1] == ["research"] and len(a) >= 2 and a[1] in ("on", "off"):
+            s.set_pref("research_online", a[1] == "on")
+            msg = f"Online research (MedlinePlus keyword lookup) {a[1]}."
         elif a[:1] == ["pause"]:
             s.set_pref("paused", True)
             msg = "All scheduled messages paused. /settings resume to restart."
@@ -318,7 +326,7 @@ class Assistant:
         text = ((msg + "\n\n") if msg else "") + (
             f"<b>Settings</b>\nDaily brief: {'on' if p['brief_enabled'] else 'off'} at {p['brief_time']} "
             f"New York\nWeekly review: {'on' if p['weekly_enabled'] else 'off'}\nQuiet hours: "
-            f"{p['quiet_start']}–{p['quiet_end']}\nMode: {p['mode']}\nPaused: {'yes' if p['paused'] else 'no'}\n\n"
+            f"{p['quiet_start']}–{p['quiet_end']}\nOnline research: {'on' if p['research_online'] else 'off'}\nMode: {p['mode']}\nPaused: {'yes' if p['paused'] else 'no'}\n\n"
             "Change with e.g. <code>/settings brief 07:30</code>, <code>/settings brief on</code>, "
             "<code>/settings weekly on</code>, <code>/settings quiet 22:30-07:00</code>, "
             "<code>/settings pause</code>")
@@ -381,7 +389,7 @@ class Assistant:
         if card["domain"] == "health":
             if intent == "next":
                 return self.emit(chat, A.improve(now=self.now()), reply_to=msg_id)
-            return self.emit(chat, A.explain_health(), reply_to=msg_id)
+            return self.emit(chat, A.explain_health(now=self.now()), reply_to=msg_id)
         if card["domain"] == "brief":
             return self.emit(chat, Reply("This brief lists at most three things from your data. "
                                          "Tap a domain button to see the details and the dates "
@@ -419,7 +427,7 @@ class Assistant:
         if action == "improve":
             return self.emit(chat, A.improve(now=self.now()))
         if action == "explain_health":
-            return self.emit(chat, A.explain_health(), reply_to=reply_to)
+            return self.emit(chat, A.explain_health(now=self.now()), reply_to=reply_to)
         if action == "sync_help":
             return self.emit(chat, A.sync_help())
         if action == "sources":

@@ -54,3 +54,30 @@ New finding: simulated BTC/ETH positions 250/251 were opened by `crypto_mention`
 * Health baselines start after ~5 complete days. Sleep requires enabling Sleep Analysis in Health Auto Export.
 * There is no hosted research model. Novel questions are saved locally rather than researched live.
 * The PLUTO data-dictionary version was not machine-verified.
+
+## Claim/evidence review (2026-10-06)
+
+Claims in fixed answer text, checked against the page each one cites. Verdicts: **supported** (the page says it), **reworded** (changed to match the page), **labelled** (kept, but marked as interpretation), **removed**.
+
+| Answer | Claim | Source | Verdict |
+|---|---|---|---|
+| activity | 150 min/week moderate (or 75 vigorous), plus 2 days of strength work | CDC Adult Activity (2023-12-20) | supported |
+| sleep | Adults 18–60: 7+ hours | CDC About Sleep (2024-05-15) | supported |
+| sleep | Fixed wake time, earplugs/eye mask | none | labelled as interpretation |
+| sexual | Inactivity, smoking, heavy drinking, drug use and blood-vessel disease are linked to ED | NIDDK Symptoms & Causes (2024-10) | supported |
+| sexual | "don't vape nicotine" | not on the page | removed |
+| sexual | "condoms" | CDC prevention page not retrieved | removed |
+| sexual | See a clinician for persistent change; ED can be a sign of another problem | NIDDK | reworded to match the page |
+| sexual | "blood in urine or semen" as a red flag | not retrieved | removed |
+| sexual | Kegels aren't for everyone; check with a clinician first | NIDDK Kegel (2021-11) | supported |
+| sexual | STI testing schedules depend on group | CDC STI Testing (2026-03-17) | supported |
+| HRV | Apple Watch HRV is SDNN, from irregular short readings | validation literature (PMC) via search; not in the registry | supported as a description; not cited in the bot |
+| HRV/RHR | "Lower RHR tracks fitness", "varies a lot between people" | none | removed / labelled as interpretation |
+| mobility | No peer-reviewed controlled trials of GOATA found | search 2026-10-06 + goatamovement.com | supported, scoped to that search |
+| mobility | "no routine realigns bones" | none | reworded: "I found no evidence that…" |
+| workouts | Doses and technique | no cited source | general routine; the safety stop rule is generic |
+| property | DEED = grantor → grantee; MTGE = mortgagor/mortgagee loan | ACRIS Document Control Codes | supported |
+| property | Mortgage "ownership did not change", "routine refinance" | unsupported | removed |
+| quant | "real trading would do worse" | unsupported as a guarantee | reworded as a simulation limitation |
+
+Researched answers (`surfaces/research.py`) quote MedlinePlus sentences word for word, so they cannot misstate their source. Their remaining risks are **relevance** (handled by the title/all-keyword gate) and **applicability**, which the answer labels.

@@ -108,6 +108,7 @@ PRIVACY = """<b>Privacy, plainly</b>
 • This bot uses no hosted AI model for your health data. Answers are computed on the Dell from fixed rules and vetted sources.
 • Only your numeric Telegram account, in a private chat, is answered. Anyone else is ignored.
 • Logs record timing and errors, not your messages or health values.
+• For questions outside the vetted list, up to 3 topic keywords (e.g. “caffeine sleep”, never your numbers or the full question) are sent to NIH's MedlinePlus search. Turn this off with <code>/settings research off</code>.
 • /forget deletes this assistant's local data (preferences, focus list, card history, saved questions). It does not delete your phone's Health data, the Dell's imported health.db, or messages already in Telegram (delete those in the app)."""
 
 
@@ -141,69 +142,122 @@ def coverage_text(cov) -> str:
     if not cov["last_import"]:
         return "No health export has reached the Dell yet."
     age = cov["import_age_h"]
-    stale = " — <b>older than a day; open Health Auto Export to sync</b>" if age and age > 26 else ""
-    sleep = ("sleep records: none exported yet" if not cov["sleep_records"]
-             else f"sleep records: {cov['sleep_records']}")
-    return (f"Last import: {_et(cov['last_import'])} ({age:.0f} h ago){stale}\n"
-            f"History: {cov['days']} day(s), {cov['first_day']} → {cov['last_day']}; "
-            f"{sleep}; workouts: {cov['workouts']}\n"
-            f"Devices: {esc(', '.join(cov['devices']) or 'unknown')}")
+    stale = " — <b>over a day old; open Health Auto Export to sync</b>" if age and age > 26 else ""
+    return f"Latest export: {_et(cov['last_import'])} ({age:.0f} h ago){stale}"
+
+
+def _day_status(d, cov):
+    """Finished-day status and recording coverage are different facts.
+    'Finished' = the calendar day ended and an export arrived afterwards.
+    Coverage (how much of the day the watch was worn/recording) is not in a
+    daily-aggregate export, so it is reported as unknown, never assumed."""
+    bits = ["day finished and exported after midnight"]
+    if d.isoformat() == cov["first_day"]:
+        bits.append("first day on record, so it may start partway through the day")
+    bits.append("wear/recording coverage unknown (export has daily totals only)")
+    return "; ".join(bits)
+
+
+SHORT = [("step_count", "steps"), ("resting_heart_rate", "resting HR"),
+         ("heart_rate_variability", "HRV")]
+
+
+def _short_line(conn, d, imp):
+    parts = []
+    for m, name in SHORT:
+        f = hf.fact(conn, m, d, imp)
+        if f.value is not None:
+            parts.append(f"{name} {hf.fmt(f.value, '' if m == 'step_count' else f.unit)}")
+    return " · ".join(parts)
 
 
 def health_summary(conn=None, now=None) -> Reply:
+    """Short card. Full measurements live behind 'Explain numbers'."""
     conn = conn or health_conn()
     now = now or _now()
     cov = hf.coverage(conn, now)
     full, partial = _target_days(cov)
-    lines = ["<b>Health — your recorded data</b>", coverage_text(cov), ""]
-    snap = {"coverage": {k: (str(v) if k == "last_import" else v) for k, v in cov.items()}}
     imp = cov["last_import"]
-    for label, d in (("Last complete day", full), ("Today so far", partial)):
-        if not d:
-            continue
-        lines.append(f"<b>{label} ({d.strftime('%a %b %d')})</b>")
-        if d.isoformat() == cov["first_day"]:
-            lines.append("<i>First day on record: it may not cover the whole day of wear.</i>")
-        for m in KEY_METRICS:
-            f = hf.fact(conn, m, d, imp)
-            if f.value is not None:
-                lines.append("• " + esc(hf.describe(f, cov["days"] >= 7)))
-                snap[f"{d}:{m}"] = f.value
-        lines.append("")
-    if cov["days"] < 7:
-        lines.append(f"<i>Only {cov['days']} day(s) of history, so there is no personal baseline "
-                     "yet. Trends and comparisons start after ~5 complete days.</i>")
-    if full is None and partial is None:
+    lines = ["<b>Health</b>", coverage_text(cov)]
+    if full:
+        lines.append(f"<b>{full.strftime('%a %b %d')}</b> (finished day): {esc(_short_line(conn, full, imp))}")
+    if partial:
+        lines.append(f"<b>{partial.strftime('%a %b %d')}</b>, as of the {_et(imp)} export (not live): "
+                     f"{esc(_short_line(conn, partial, imp))} so far")
+    if not full and not partial:
         lines.append("No measurements to show.")
-    return Reply("\n".join(lines).strip(), domain="health", ref={"kind": "summary"},
-                 snapshot=snap,
-                 actions=[("Steps 7d", "trend", "step_count:7"),
-                          ("Steps 30d", "trend", "step_count:30"),
+    gaps = []
+    if cov["days"] < 7:
+        gaps.append(f"{cov['days']} day(s) of history: no baseline yet")
+    if not cov["sleep_records"]:
+        gaps.append("no sleep data")
+    if not cov["workouts"]:
+        gaps.append("no workouts")
+    if gaps:
+        lines.append("<i>" + esc("; ".join(gaps)) + ".</i>")
+    snap = {"coverage": {k: (str(v) if k == "last_import" else v) for k, v in cov.items()},
+            "full": full.isoformat() if full else None,
+            "partial": partial.isoformat() if partial else None}
+    return Reply("\n".join(lines), domain="health", ref={"kind": "summary"}, snapshot=snap,
+                 actions=[("Explain numbers", "explain_health", ""),
+                          ("Steps 7d", "trend", "step_count:7"),
                           ("Two things to improve", "improve", ""),
-                          ("Explain numbers", "explain_health", ""),
-                          ("Refresh / sync help", "sync_help", "")])
+                          ("Sync help", "sync_help", "")])
 
 
 EXPLAIN_HEALTH = """<b>What these numbers mean</b>
-• <b>Steps / exercise minutes / active energy</b> are totals for a calendar day (New York time). A day that hasn't finished, or hasn't fully synced, is a running total — a low number at 9 am is not a lazy day.
-• <b>Active energy</b> is Apple's estimate from motion and heart rate, not a measurement.
-• <b>Resting heart rate</b> is Apple's daily estimate. Lower usually tracks fitness, but day-to-day swings of a few bpm are normal.
-• <b>HRV</b> on Apple Watch is <b>SDNN</b> in milliseconds, from short readings taken at irregular times; we show that day's average. It is noisy, varies a lot between people, and can't be compared with other devices' RMSSD numbers. Only your own multi-week trend is meaningful.
+• <b>Steps / exercise minutes / active energy</b> are totals for a New York calendar day. Before the day ends, or before the next export, they are running totals: a low number in the morning is not a low day.
+• <b>Active energy</b> is Apple's estimate from motion and heart rate, not a direct measurement.
+• <b>Resting heart rate</b> is Apple's daily estimate.
+• <b>HRV</b> on Apple Watch is <b>SDNN</b> (ms) from short readings at irregular times; shown as that day's average. Not comparable with RMSSD from other devices.
 • <b>Blood oxygen</b> is a wellness spot reading, not a medical oximeter.
-• A <b>baseline</b> appears only once there are ≥5 complete prior days (7-day) or ≥14 (30-day); the sample count is always shown."""
+• A <b>baseline</b> appears only with ≥5 complete prior days (7-day) or ≥14 (30-day); the count n is shown.
+<i>Interpretation, not from a cited source: single-day HRV and resting-HR changes are noisy; only multi-week trends of your own numbers are worth reading.</i>"""
 
 
-def explain_health() -> Reply:
-    return Reply(EXPLAIN_HEALTH, domain="health")
+def explain_health(conn=None, now=None) -> Reply:
+    """Every stored measurement for the days on the card, with status, then meanings."""
+    try:
+        conn = conn or health_conn()
+    except Exception:
+        return Reply(EXPLAIN_HEALTH, domain="health")
+    now = now or _now()
+    cov = hf.coverage(conn, now)
+    full, partial = _target_days(cov)
+    imp = cov["last_import"]
+    lines = ["<b>All measurements</b>", coverage_text(cov),
+             f"History: {cov['days']} day(s), {cov['first_day']} → {cov['last_day']}; "
+             f"devices: {esc(', '.join(cov['devices']) or 'unknown')}", ""]
+    for d, head in ((full, "finished day"), (partial, f"as of the {_et(imp)} export")):
+        if not d:
+            continue
+        lines.append(f"<b>{d.strftime('%a %b %d')}</b> ({esc(head)})")
+        if d == full:
+            lines.append("<i>" + esc(_day_status(d, cov)) + "</i>")
+        for m in KEY_METRICS:
+            f = hf.fact(conn, m, d, imp)
+            if f.value is not None:
+                lines.append("• " + esc(hf.describe(f, True)))
+        lines.append("")
+    return Reply("\n".join(lines) + EXPLAIN_HEALTH, domain="health", ref={"kind": "explain"})
 
 
-SYNC_HELP = """<b>Keeping your data current</b>
-Your data arrives from the iPhone app <b>Health Auto Export</b>, which POSTs to the Dell over Tailscale. Nothing is real-time.
-1. Open Health Auto Export → Automations → your REST API automation.
-2. Make sure it includes the metrics you care about. <b>Sleep Analysis is not arriving yet</b>; add it if you want sleep answers.
-3. Keep “Aggregate data: by day”.
-4. Tap “Export now” (or “Manual export”) to send immediately. Background exports only run when iOS allows; opening the app helps.
-Then ask /health again: the “Last import” time should update."""
+SYNC_HELP = """<b>Turn on sleep and workout exports</b>
+Data reaches the Dell only when the iPhone app <b>Health Auto Export</b> sends it (over Tailscale). Nothing is live.
+
+<b>Sleep</b>
+1. Apple Watch: set up a sleep schedule (Health app → Browse → Sleep), turn on <b>Track Sleep with Apple Watch</b> (Watch app on iPhone → Sleep), and wear the watch to bed. Without that there is nothing to export.
+2. Health Auto Export → Automations → your REST API automation → Data Type: Health Metrics → Select Metrics → enable <b>Sleep Analysis</b> (keep your current metrics on).
+3. Keep “Aggregate data: by day” (sleep is still sent as nightly sessions).
+
+<b>Workouts</b>
+4. Same app → Automations → add (or edit) a REST API automation with Data Type <b>Workouts</b>, same URL and the same Authorization header as your Health Metrics automation.
+5. Start workouts on the watch (Workout app → e.g. Kickboxing or Functional Strength) so they exist in Apple Health.
+
+<b>Check it worked</b>
+6. In each automation tap <b>Manual Export</b>, choose the last 7 days, and send.
+7. Here, send /health. The card should no longer say “no sleep data” / “no workouts”, and “Latest export” should show the time you just sent. /status shows the same thing from the Dell's side.
+Background exports only run when iOS allows; opening the app now and then helps."""
 
 
 def sync_help() -> Reply:
@@ -315,8 +369,8 @@ def sleep_answer(conn=None, now=None) -> Reply:
         body = (f"<b>Your data:</b> {cov['sleep_records']} sleep record(s) stored. "
                 "Weekly comparisons need at least 5 nights.")
     text = ("<b>Sleep</b>\n" + body + "\n\n<b>General evidence:</b> adults 18–60 should get 7 or "
-            "more hours a night (CDC). Consistent bed/wake times are the most practical lever in a "
-            "dorm: same wake time daily, dim screens 30 min before bed, earplugs/eye mask.")
+            "more hours a night (CDC).\n<i>Interpretation, not from a cited source: in a dorm, a fixed wake "
+            "time and earplugs/eye mask are the easiest things to control.</i>")
     return Reply(text, domain="health", ref={"kind": "sleep"},
                  actions=[("Sources", "sources", "sleep"), ("Sync help", "sync_help", ""),
                           ("Add sleep to brief", "focus_propose", "sleep consistency")])
@@ -326,17 +380,17 @@ def sexual_health() -> Reply:
     text = """<b>Sexual health — what your data can and can't tell</b>
 <b>Can't tell:</b> your watch data cannot measure hormones, sexual function, fertility or STI status. I won't infer any of those from steps or heart rate.
 
-<b>Can loosely reflect:</b> the general cardiovascular and lifestyle factors that matter for sexual health — regular activity, resting heart rate trend, and (once exported) sleep.
+<b>Can loosely reflect</b> <i>(interpretation)</i>: lifestyle factors the sources below link to sexual health, namely activity level and (once exported) sleep.
 
 <b>General evidence (NIDDK):</b> inactivity, smoking, heavy drinking, drug use and blood-vessel problems such as high blood pressure are linked to erectile problems; heart-healthy habits support blood-vessel health.
 
 <b>Practical, for anyone:</b>
-• Regular activity (150 min/week) and 7+ hours of sleep.
-• Keep alcohol moderate; don't smoke or vape nicotine.
-• Consent and condoms; STI testing on a schedule that fits your situation (CDC's page lists schedules by group — a campus health center can tell you which applies).
-• Kegels/pelvic-floor routines aren't a default for everyone; NIDDK advises checking with a clinician first.
+• Regular activity (CDC: 150 min/week) and sleep (CDC: 7+ hours for adults).
+• Avoid smoking and heavy drinking (NIDDK lists both as factors).
+• STI testing on a schedule that fits your situation: CDC lists schedules by group, and a campus health center can tell you which applies.
+• Kegels/pelvic-floor routines aren't a default for everyone; NIDDK says to check with a clinician first.
 
-<b>See a clinician</b> for any persistent change in erections or libido, pain, discharge, sores, or blood in urine or semen. Campus health is a fine first stop.
+<b>See a clinician</b> if you notice a persistent change in sexual function; NIDDK notes erectile problems can be a sign of another health problem. Any symptom that worries you, such as pain or sores, is also worth a campus-health visit.
 
 This topic won't appear in your daily briefs unless you add it yourself."""
     return Reply(text, domain="health", ref={"kind": "sexual"}, sensitive=True,
@@ -351,7 +405,7 @@ def mobility(profile_text="") -> Reply:
              "<b>Evidence check:</b> GOATA is a commercial method; I found no peer-reviewed "
              "controlled trials of GOATA itself (searched Oct 6, 2026). General strength, balance "
              "and mobility work has much better support. There's no single correct foot angle or "
-             "gait for everyone, and no routine will “realign” bones.\n\n")
+             "gait for everyone, and I found no evidence that any routine “realigns” bones.\n\n")
     plan = workouts.render("mobility10", workouts.profile_notes(profile_text))
     return Reply(intro + plan, domain="health", ref={"kind": "workout", "plan": "mobility10"},
                  actions=[("Done", "fb", "done"), ("Too easy", "fb", "easy"),
@@ -432,11 +486,11 @@ def property_card(item, conn=None, now=None) -> Reply:
 def property_explain(f: dict) -> Reply:
     dt = f["doc_type"]
     if dt == "MTGE":
-        core_ = ("This record is a <b>mortgage</b>: the owner borrowed money and pledged the "
-                 "building as security. Think of it like a car loan where the car is the "
-                 f"collateral. The {pf.money(f['amount'])} is how much was borrowed. It does not "
-                 "tell you what the building is worth or that it was sold. Big buildings refinance "
-                 "regularly, so this is often routine.")
+        core_ = ("This record is a <b>mortgage</b>: the borrower (mortgagor) recorded a loan from a "
+                 "lender (mortgagee), with the property pledged as security. "
+                 f"The {pf.money(f['amount'])} is the loan amount stated on the document. It is not a "
+                 "price or a valuation. A mortgage is not a transfer document, so this record alone "
+                 "doesn't tell us whether ownership changed; a sale would be a separate deed.")
     elif dt in ("DEED", "DEEDO"):
         core_ = ("This record is a <b>deed</b>: ownership passed from the grantor (seller) to the "
                  f"grantee (buyer). The {pf.money(f['amount'])} is the stated consideration, usually "
@@ -455,7 +509,8 @@ def property_explain(f: dict) -> Reply:
 def property_saleloan(f: dict) -> Reply:
     dt = f["doc_type"]
     if dt == "MTGE":
-        t = "<b>A loan.</b> MTGE = mortgage. Ownership didn't change because of this document."
+        t = ("<b>A loan record.</b> MTGE = mortgage: financing secured by the property. This document "
+             "doesn't transfer ownership; whether a sale also happened would show up as a separate deed.")
     elif dt == "DEED":
         t = ("<b>An ownership transfer</b> (a deed). Usually a sale; nominal amounts, related-party "
              "transfers and partial interests are exceptions we can't rule out from this record alone.")
@@ -539,8 +594,8 @@ def quant_summary(conn=None, now=None) -> Reply:
              ]
     if ch is not None:
         lines.append(f"Last 24 h: {sd(ch)} equity change.")
-    lines.append("<i>Returns are from a simulator that fills at the last quoted price with no "
-                 "fees or slippage, so real trading would do worse.</i>")
+    lines.append("<i>Simulation limits: fills at the last quoted price; fees, spreads and slippage "
+                 "are not modelled. Treat this as a test of the rules, not an estimate of live results.</i>")
     return Reply("\n".join(lines), domain="quant", ref={"kind": "summary"}, snapshot=a,
                  actions=[("Open positions", "q_positions", ""), ("How return is calculated", "q_calc", ""),
                           ("Risks & missing assumptions", "q_risks", "")])
@@ -560,7 +615,7 @@ def quant_calc(a: dict) -> Reply:
 
 
 QUANT_RISKS = """<b>Risks and missing assumptions</b>
-• <b>No costs modelled:</b> fills at last price, no fees, spreads or slippage.
+• <b>Costs not modelled:</b> the simulator fills at the last price with no fees, spreads or slippage. These are limitations of the simulation; its results are not an estimate of live performance.
 • <b>Short history:</b> a few weeks of simulation says little about future results.
 • <b>Rule triggers are keyword matches</b> on headlines or market moves. A headline is evidence that something was reported, not that it is true or that it moved prices.
 • <b>Expiry artefacts:</b> some crypto entries were triggered by short-dated prediction markets dropping to ~1% at their end time — that's a market settling, not news. Flagged for review in eventbot's rules.
@@ -607,3 +662,74 @@ def quant_why(position_id: int, conn=None) -> Reply:
     lines.append("<i>A headline shows that something was reported, not that it's true or that it moved the price.</i>")
     links = [("Signal source", w["signal"]["url"])] if w["signal"] and w["signal"].get("url") else []
     return Reply("\n".join(lines), domain="quant", links=links)
+
+
+# ── researched answers (novel questions) ──────────────────────────────
+
+PERSONAL_HOOKS = [
+    (("sleep", "insomnia", "caffeine", "nap", "tired"), "sleep"),
+    (("sit", "sitting", "inactive", "walk", "walking", "steps", "exercise", "activity",
+      "protein", "creatine", "muscle", "cardio"), "activity"),
+    (("heart", "pulse", "hrv", "blood", "pressure", "stress", "anxiety"), "heart"),
+]
+
+
+def _personal_lines(kws, conn, now):
+    want = {tag for words, tag in PERSONAL_HOOKS for k in kws if k in words}
+    if not want:
+        return []
+    cov = hf.coverage(conn, now)
+    full, _ = _target_days(cov)
+    out = []
+    if "sleep" in want:
+        out.append("Sleep: no sleep records exported yet, so I can't relate this to your nights."
+                   if not cov["sleep_records"] else f"Sleep records stored: {cov['sleep_records']}.")
+    if full and "activity" in want:
+        for m in ("step_count", "apple_exercise_time"):
+            f = hf.fact(conn, m, full, cov["last_import"])
+            if f.value is not None:
+                out.append(hf.describe(f, cov["days"] >= 7))
+    if full and "heart" in want:
+        for m in ("resting_heart_rate", "heart_rate_variability"):
+            f = hf.fact(conn, m, full, cov["last_import"])
+            if f.value is not None:
+                out.append(hf.describe(f, cov["days"] >= 7))
+    if out and cov["days"] < 7:
+        out.append(f"Only {cov['days']} day(s) of history, so this can't show a personal pattern yet.")
+    return out
+
+
+def research_answer(question, store_conn=None, online=True, now=None, opener=None) -> Reply:
+    from surfaces import research
+    now = now or _now()
+    r = research.lookup(question, store_conn, online=online, opener=opener, now=now.timestamp())
+    kws = r["keywords"]
+    try:
+        mine = _personal_lines(kws, health_conn(), now)
+    except Exception:
+        mine = []
+    if r.get("status") != "ok" or not r["sources"]:
+        why = {"none": "I couldn't find an NIH MedlinePlus topic that matches",
+               "offline": "The research source couldn't be reached right now, and nothing is cached for",
+               "disabled": "Online research is off (/settings research on), and nothing is cached for"
+               }.get(r.get("status"), "I have nothing vetted on")
+        text = (f"{why} “{esc(' '.join(kws) or question[:40])}”, so I won't guess. "
+                "I saved the question locally for follow-up research.")
+        if mine:
+            text += "\n\n<b>Your data that might matter:</b>\n" + "\n".join("• " + esc(x) for x in mine)
+        return Reply(text, domain="research", ref={"kind": "research", "status": r.get("status")})
+    lines = [f"<b>Researched answer</b> (keywords sent: “{esc(' '.join(kws))}”)",
+             f"<b>General evidence</b>: NIH MedlinePlus, retrieved {esc(r.get('retrieved') or '')}"
+             + (" (cached)" if r.get("cached") else "") + ". These are the source's own sentences:"]
+    links = []
+    for src in r["sources"]:
+        lines.append(f"<b>{esc(src['title'])}</b>")
+        lines += [f"“{esc(q)}”" for q in src["quotes"]]
+        links.append((src["title"][:36], src["url"]))
+    if mine:
+        lines += ["", "<b>Your data</b>"] + ["• " + esc(x) for x in mine]
+    lines += ["", "<i>Interpretation: these pages describe the topic in general and were matched by "
+              "keyword, not reviewed for your situation. For supplements, medicines or symptoms, ask a "
+              "clinician or pharmacist.</i>"]
+    return Reply("\n".join(lines), domain="research", ref={"kind": "research"},
+                 snapshot={"keywords": kws, "sources": r["sources"]}, links=links)

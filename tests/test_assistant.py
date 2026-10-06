@@ -276,7 +276,7 @@ class TestServices(Base):
     def test_deed_vs_mortgage(self):
         m = pf.card_facts({"data": {"doc_type": "MTGE", "amount": 1e7, "in_pluto": True}},
                           {"percent_trans": 0, "n_parcels": 1})
-        self.assertIn("not a sale", m["what"])
+        self.assertIn("financing document, not a transfer", m["what"])
         self.assertIn("NOT the property's price", m["amount_means"])
         self.assertEqual(m["caveats"], [])          # 0% "transferred" is meaningless on a loan
         d = pf.card_facts({"data": {"doc_type": "DEED", "amount": 10}},
@@ -436,10 +436,17 @@ class TestBot(Base):
         self.env.imported(_iso(2026, 10, 6, 8))
         self.msg("/health")
         t = self.last()
-        self.assertIn("Last import", t)
-        self.assertIn("running total", t)
-        self.assertIn("no personal baseline", t.replace("There is no", "no").lower()
-                      .replace("so there is no personal baseline", "no personal baseline"))
+        self.assertIn("Latest export", t)
+        self.assertIn("as of the", t)                 # today's values tied to the export time
+        self.assertIn("not live", t)
+        self.assertNotIn("Today so far", t)
+        self.assertLess(len(re.sub("<[^>]+>", "", t)), 450)   # short card
+        mid = self.bot.sent[-1]["id"]
+        self.press(self.tokens(mid)["explain_health"], mid)
+        full = self.last()
+        self.assertIn("running total", full)
+        self.assertIn("wear/recording coverage unknown", full)
+        self.assertIn("first day on record", full)
         self.msg("Based on my recent data, what are the two most useful things to improve this week?")
         mid = self.bot.sent[-1]["id"]
         self.press(self.tokens(mid)["sources"], mid)
@@ -458,10 +465,77 @@ class TestBot(Base):
         vals = [x[1] for x in card["snapshot"]["points"]]
         self.assertEqual(vals.count(None), 5)
 
+    def _fake_fetch(self, xml, seen):
+        class R:
+            def __init__(s, b): s.b = b
+            def read(s): return s.b
+            def __enter__(s): return s
+            def __exit__(s, *a): return False
+
+        def opener(req, timeout=None):
+            seen.append(req.full_url)
+            if xml is None:
+                raise OSError("offline")
+            return R(xml.encode())
+        return opener
+
+    XML = """<?xml version="1.0"?><nlmSearchResult><list>
+      <document url="https://medlineplus.gov/heartattack.html"><content name="title">Heart Attack</content>
+        <content name="FullSummary">&lt;p&gt;A heart attack happens when blood flow stops.&lt;/p&gt;</content></document>
+      <document url="https://medlineplus.gov/caffeine.html"><content name="title">Caffeine</content>
+        <content name="FullSummary">&lt;p&gt;Caffeine is a stimulant found in coffee and tea. Too much caffeine can cause trouble sleeping.&lt;/p&gt;</content></document>
+      </list></nlmSearchResult>"""
+
     def test_unknown_question_not_guessed(self):
+        seen = []
+        self.app.research_opener = self._fake_fetch(self.XML, seen)
         self.msg("should I take creatine?")
         self.assertIn("won't guess", self.last())
+        self.assertNotIn("Heart Attack", self.last())   # loose ranking is not relevance
         self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM research").fetchone()[0], 1)
+
+    def test_novel_question_retrieves_quotes_and_personal_data(self):
+        self.env.sample("step_count", "2026-10-05", 343)
+        self.env.imported(_iso(2026, 10, 6, 8))
+        seen = []
+        self.app.research_opener = self._fake_fetch(self.XML, seen)
+        self.msg("Does caffeine affect my sleep? I slept 5 hours and my HRV was 58")
+        t = self.last()
+        self.assertIn("Researched answer", t)
+        self.assertIn("trouble sleeping", t)              # the source's own sentence
+        self.assertNotIn("Heart Attack", t)
+        self.assertIn("no sleep records", t)              # relevant personal data, honestly
+        self.assertIn("medlineplus.gov/caffeine", json.dumps(self.bot.sent[-1]["buttons"]))
+        q = seen[0].split("term=")[1]
+        self.assertNotIn("58", q)                         # only keywords leave the box
+        self.assertNotIn("5", q.split("&")[0])
+        self.assertLessEqual(len(q.split("&")[0].split("+")), 3)
+        # offline: answered from cache
+        self.app.research_opener = self._fake_fetch(None, seen)
+        self.msg("Does caffeine affect my sleep? I slept 5 hours and my HRV was 58")
+        self.assertIn("(cached)", self.last())
+
+    def test_research_offline_and_disabled(self):
+        self.app.research_opener = self._fake_fetch(None, [])
+        self.msg("is posture important")
+        self.assertIn("couldn't be reached", self.last())
+        self.msg("/settings research off")
+        seen = []
+        self.app.research_opener = self._fake_fetch(self.XML, seen)
+        self.msg("tell me about melatonin")
+        self.assertIn("research is off", self.last())
+        self.assertEqual(seen, [])
+
+    def test_wording_has_no_unsupported_claims(self):
+        from surfaces import assistant as A
+        f = pf.card_facts({"data": {"doc_type": "MTGE", "amount": 1e7}}, {"n_parcels": 1})
+        for txt in (f["what"], A.property_explain(f).text, A.property_saleloan(f).text):
+            self.assertNotIn("did not change", txt)
+            self.assertNotIn("didn't change", txt)
+            self.assertNotIn("routine", txt)
+        self.msg("/quant")
+        self.assertNotIn("worse", self.last())
+        self.assertIn("not modelled", self.last())
 
     def test_forget_leaves_source_data(self):
         self.store.add_focus("walking")
@@ -477,8 +551,8 @@ class TestBot(Base):
         self.env.imported(_iso(2026, 10, 6, 8))
         self.msg("/health")
         self.msg("Help me support my sexual health")
-        rows = " ".join(str(r) for r in self.store.conn.execute("SELECT * FROM telemetry"))
-        self.assertNotIn("68", rows.replace("1791", ""))
+        rows = " ".join(str(tuple(r)[1:]) for r in self.store.conn.execute("SELECT * FROM telemetry"))
+        self.assertNotIn("68", rows)
         self.assertNotIn("sexual health", rows)
 
     def test_token_scrubbed_from_errors(self):

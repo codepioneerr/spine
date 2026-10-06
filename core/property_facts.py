@@ -29,8 +29,9 @@ DOC_TYPES = {
               "arm's-length sale (e.g. corrections, entity transfers). Treat the amount with caution."),
     "MTGE": ("Mortgage (loan secured by the property)", "Mortgages & instruments",
              "mortgagor / borrower", "mortgagee / lender",
-             "A borrower pledged the property as security for a loan. This is "
-             "financing, not a sale: ownership did not change because of this document."),
+             "A borrower recorded a mortgage: a loan secured by this property. A mortgage is a "
+             "financing document, not a transfer document. It says nothing by itself about whether "
+             "ownership changed; a transfer would appear as a separate deed."),
     "AGMT": ("Agreement (often mortgage-related)", "Mortgages & instruments",
              "party 1", "party 2", "An agreement filed against the property, frequently "
                                    "consolidating or modifying existing mortgages."),
@@ -61,8 +62,8 @@ GLOSSARY = {
             "grantor (seller) to a grantee (buyer). Recording it with the City Register makes "
             "the transfer public. It does not prove the title is free of problems.",
     "mortgage": "A mortgage (ACRIS code MTGE) is a document in which a borrower pledges the "
-                "property as security for a loan from a lender. Its amount is the loan, not a price. "
-                "Buildings refinance often, so a mortgage alone says nothing about a sale.",
+                "property as security for a loan from a lender. Its amount is the loan, not a price, "
+                "and a mortgage record alone does not tell you whether a sale happened.",
     "mtge": "MTGE is ACRIS's code for a mortgage: a loan secured by the property. See /glossary mortgage.",
     "grantor": "The party giving up ownership in a deed (usually the seller).",
     "grantee": "The party receiving ownership in a deed (usually the buyer).",
@@ -140,6 +141,7 @@ def card_facts(item: dict, doc: dict | None = None, now: datetime | None = None,
         unknown.append("whether this was an arm's-length market sale")
     if dt == "MTGE":
         unknown.append("the property's price or value (a loan amount is not a price)")
+        unknown.append("whether a sale happened around the same time (check for a separate deed)")
     unknown.append("whether the property is for sale now (a filing does not say)")
     caveats = []
     if n_parcels and n_parcels > 1:

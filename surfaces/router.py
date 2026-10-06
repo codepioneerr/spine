@@ -78,3 +78,20 @@ def trend_metric(text: str):
         if word in t:
             return m, days
     return "step_count", days
+
+
+# Words the canned health answers already cover. If a health-ish question
+# names anything else (caffeine, creatine, posture...), it is a novel
+# question and goes to research instead of a canned reply.
+COVERED = set("""sleep slept sleeping changed change trend chart graph steps step hrv heart rate resting
+oxygen calories kcal health improve two most useful things activity active guidance general guideline
+guidelines compare minutes week weeks month time over this last show see insomnia bedtime""".split())
+NOVEL_OK = {"sleep", "health", "activity", "improve", "trend", "unknown"}
+
+
+def novel(text: str, intent: str) -> bool:
+    if intent not in NOVEL_OK:
+        return False
+    from surfaces.research import keywords
+    extra = [k for k in keywords(text, limit=6) if k not in COVERED]
+    return bool(extra) or intent == "unknown"

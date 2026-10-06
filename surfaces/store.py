@@ -61,6 +61,7 @@ DEFAULTS = {
     "mode": "compact",             # compact | detailed
     "domains": ["health", "property", "quant"],
     "paused": False,
+    "research_online": True,       # keyword-only MedlinePlus lookups (see /privacy)
 }
 
 CALLBACK_TTL_S = 7 * 24 * 3600
