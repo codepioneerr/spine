@@ -358,7 +358,26 @@ class TestBriefJobDegrades(unittest.TestCase):
 
         job._keep = fake_keep
         self.addCleanup(setattr, job, "_keep", original_keep)
+
+        # The real check reads this box's /proc/meminfo and can sleep for
+        # minutes. These tests are about the model failing, not about RAM.
+        original_ram = job.judgment_ram
+        job.judgment_ram = lambda log: (True, 9999, 4524)
+        self.addCleanup(setattr, job, "judgment_ram", original_ram)
         return job
+
+    def test_low_ram_skips_the_model_but_still_sends(self):
+        job = self._patch_build()
+        job.judgment_ram = lambda log: (False, 1052, 4524)
+        ctx = _Ctx()
+        sent = []
+        ctx.notify.send = sent.append
+        ctx.models.complete = lambda *a, **k: self.fail("model was called")
+        out = job.run(ctx)
+        self.assertTrue(out["stats"]["sent"])
+        self.assertFalse(out["stats"]["judgment"])
+        self.assertIn("a deed", sent[0])
+        self.assertIn("machine read skipped: 1052 MB free", sent[0])
 
     def test_the_brief_is_preserved_before_it_is_sent(self):
         """Order matters: generated-then-undelivered must still leave a copy."""
@@ -483,6 +502,64 @@ class TestSuppressedBreakdown(unittest.TestCase):
     def test_an_unknown_kind_is_named_not_swallowed(self):
         out = self._out({"invented": 3})
         self.assertIn("3 invented", out)
+
+
+
+class TestBriefRamCheck(unittest.TestCase):
+    """Oct 5 2026: 'SKIP insufficient RAM: 1052 MB free, needs 4524 MB' cost a
+    whole brief although layer 1 needs ~100 MB. The model step is what needs
+    the RAM, so that is what is gated -- and the gate is not lowered."""
+
+    def setUp(self):
+        from collectors import brief as bc
+        self.bc = bc
+        self.lines = []
+
+    def log(self, msg, **kw):
+        self.lines.append((msg, kw))
+
+    def test_brief_job_is_light_so_a_busy_box_cannot_skip_it(self):
+        from core import job
+        j = job.validate(self.bc.META, "collectors.brief")
+        self.assertEqual(j.weight, "light")
+        self.assertLessEqual(j.ram_mb, job.LIGHT_MAX_MB)
+        self.assertEqual(j.window, "night")
+
+    def test_judgment_still_needs_the_full_model_footprint(self):
+        from core import governor
+        need = governor.Settings.from_env().headroom_mb + 3500
+        ok, free, n = self.bc.judgment_ram(self.log, avail=lambda: need - 1,
+                                           sleep=lambda s: None)
+        self.assertFalse(ok)
+        self.assertEqual(n, need)
+
+    def test_enough_ram_passes_immediately(self):
+        waits = []
+        ok, _, _ = self.bc.judgment_ram(self.log, avail=lambda: 9999,
+                                        sleep=waits.append)
+        self.assertTrue(ok)
+        self.assertEqual(waits, [])
+
+    def test_retries_then_succeeds_when_ram_frees_up(self):
+        seq = iter([1052, 1300, 6000])
+        waits = []
+        ok, free, _ = self.bc.judgment_ram(self.log, avail=lambda: next(seq),
+                                           sleep=waits.append)
+        self.assertTrue(ok)
+        self.assertEqual(free, 6000)
+        self.assertEqual(waits, [self.bc.RAM_RETRY_WAIT_S] * 2)
+
+    def test_gives_up_after_bounded_checks_without_a_trailing_sleep(self):
+        waits = []
+        ok, free, _ = self.bc.judgment_ram(self.log, avail=lambda: 1052,
+                                           sleep=waits.append)
+        self.assertFalse(ok)
+        self.assertEqual(len(waits), self.bc.RAM_CHECKS - 1)
+
+    def test_no_proc_does_not_block(self):
+        ok, free, _ = self.bc.judgment_ram(self.log, avail=lambda: None,
+                                           sleep=lambda s: None)
+        self.assertTrue(ok)
 
 
 if __name__ == "__main__":

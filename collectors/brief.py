@@ -21,17 +21,31 @@ usable paragraph that also managed to merge two separate Manhattan deeds into
 one claim. A 4.7B model at Q4 is worth a second opinion and is not worth
 trusting as the record.
 
-## Why heavy and night
+## Why the RAM check lives inside the run (Oct 6 2026)
 
 The model is ~3.6 GB resident, allocated inside the Ollama process, which
-core.governor.available_mb cannot see or attribute. Declaring ram_mb makes
-the RAM guard honest about a cost it would otherwise miss entirely. weight
-heavy then forces window night at load time, which is correct anyway: 09:40
-UTC is 05:40 ET in summer and 04:40 in winter, both inside the 01:00-06:00
-window, and both early enough that the brief is waiting rather than arriving.
+core.governor.available_mb cannot see or attribute. Until Oct 6 the brief
+declared that cost as its own (ram_mb 3500, heavy), so the whole job was
+refused whenever 4,524 MB was not free -- and on Oct 5 it was not (1,052 MB:
+open editor sessions), so no brief was sent at all, although layer 1 needs
+about 100 MB.
+
+The threshold was not lowered. 3.6 GB measured resident against a 1 GB floor
+is an OOM kill, which is the failure CLAUDE.md section 3 exists to prevent. What
+changed is *what* is refused: the job is light (it is only layer 1), and the
+model step makes the same check itself -- ram_mb 3500 plus the governor's
+headroom -- retrying briefly before giving up on commentary. Layer 1 is
+always sent. The guard's protection is unchanged; its blast radius is smaller.
+
+The window stays night: 09:40 UTC is 05:40 ET in summer and 04:40 in winter,
+early enough that the brief is waiting rather than arriving.
 """
 
 import io
+import time
+
+from core import governor
+from core.job import HARD_MAX_MB
 
 from core import brief as brief_mod
 from core import paths
@@ -43,17 +57,46 @@ META = {
     # 2.8 tok/s measured, so a 300-token paragraph is ~110 s plus model load.
     # 900 s is slack, not an expectation.
     "timeout": 900,
-    # HARD_MAX_MB. Understates the observed 3667 MB by ~270 MB, and a heavy job
-    # also gets the full 1024 MB headroom, so the guard still holds real margin.
-    "ram_mb": 3500,
+    # Layer 1 only. The model's 3.6 GB is checked inside run() against
+    # JUDGMENT_RAM_MB, so a busy box costs the commentary, not the brief.
+    "ram_mb": 100,
     "window": "night",
-    "weight": "heavy",
+    "weight": "light",
     "tier": "smart",
     # The brief is built from the item store, which holds eventbot positions.
     # Private is also the default and the correct answer here regardless.
     "data": "private",
     "description": "the morning brief",
 }
+
+# What the model step needs free: HARD_MAX_MB understates the measured 3667 MB
+# by ~270 MB, and the governor's headroom (default 1024 MB) is added on top,
+# exactly as the old heavy declaration did.
+JUDGMENT_RAM_MB = HARD_MAX_MB
+
+# Memory frees up when an editor session closes or a job finishes. A few
+# minutes of patience costs nothing against a 900 s timeout; waiting longer
+# makes the brief late, which is worse than commentary-less.
+RAM_CHECKS = 3
+RAM_RETRY_WAIT_S = 60
+
+
+def judgment_ram(log, avail=governor.available_mb, sleep=time.sleep):
+    """(ok, avail_mb, need_mb). Checks RAM up to RAM_CHECKS times, waiting
+    between checks. No /proc (not the Dell) means do not block, as in
+    governor.check_ram."""
+    need = JUDGMENT_RAM_MB + governor.Settings.from_env().headroom_mb
+    free = None
+    for attempt in range(1, RAM_CHECKS + 1):
+        free = avail()
+        if free is None or free >= need:
+            return True, free, need
+        log("judgment waiting for RAM", free_mb=free, need_mb=need,
+            attempt=attempt)
+        if attempt < RAM_CHECKS:
+            sleep(RAM_RETRY_WAIT_S)
+    return False, free, need
+
 
 # Short on purpose. The model is slow and a long paragraph is not more useful
 # than a short one, so this bounds latency as much as verbosity.
@@ -109,7 +152,16 @@ def run(ctx):
     text, rows = brief_mod.build(now=ctx.now)
     ctx.log("brief built", items=len(rows), chars=len(text))
 
-    note = judgment(ctx, text) if rows else None
+    note = None
+    if rows:
+        ok, free, need = judgment_ram(ctx.log)
+        if ok:
+            note = judgment(ctx, text)
+        else:
+            ctx.log("judgment skipped", reason="insufficient RAM",
+                    free_mb=free, need_mb=need)
+            text += (f"\n\n-- machine read skipped: {free} MB free, "
+                     f"needs {need} MB --")
     if note:
         text = text + "\n\n-- machine read (qwen3.5:4b, local, unverified) --\n" + note
 
