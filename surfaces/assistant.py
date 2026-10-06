@@ -14,7 +14,9 @@ surfaces.evidence), and "Interpretation" (ours, labelled).
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -69,6 +71,46 @@ def _et(dt):
     return dt.astimezone(hf.TZ).strftime("%a %b %d, %-I:%M %p ET") if dt else "never"
 
 
+def snap_health(cov) -> str:
+    return f"Health data as of the {_et(cov['last_import'])} export" if cov.get("last_import") \
+        else "No health export yet"
+
+
+def snap_property(conn) -> str:
+    try:
+        newest = pf.feed_newest(conn)
+        r = conn.execute("SELECT MAX(updated_ts) FROM items WHERE source='acris'").fetchone()
+        seen = datetime.fromisoformat(r[0].replace("Z", "+00:00")) if r and r[0] else None
+    except Exception:
+        return "Property data time unknown"
+    return (f"Property records as of NYC's newest recording {str(newest)[:10]}; "
+            f"last checked by us {_et(seen)}")
+
+
+def snap_quant(a) -> str:
+    try:
+        t = datetime.fromisoformat(a["as_of"].replace("Z", "+00:00"))
+        return f"Simulation as of {_et(t)}"
+    except Exception:
+        return "Simulation time unknown"
+
+
+def et_iso(s) -> str:
+    """'2026-10-06T16:05:06Z' -> 'Tue Oct 06, 12:05 PM ET' (same format as every footer)."""
+    try:
+        return _et(datetime.fromisoformat(str(s).replace("Z", "+00:00")))
+    except Exception:
+        return str(s or "?")
+
+
+def footer(text):
+    return f"\n<i>🕒 {esc(text)}</i>"
+
+
+def source_links(ids):
+    return [(s["title"].split(" — ")[-1][:40], s["url"]) for s in evidence.cite(ids)]
+
+
 def _sources(ids):
     return [(s["title"].split(" — ")[0][:28] + ": " + s["title"].split(" — ")[-1][:30], s["url"])
             for s in evidence.cite(ids)]
@@ -89,7 +131,8 @@ def sources_text(ids) -> str:
 HELP = """<b>Dell assistant</b> (this bot). One front door to your own data.
 Domains: <b>Health</b> (your Apple Health export), <b>Property</b> (NYC recorded documents), <b>Quant</b> (the trading <i>simulation</i>).
 
-Ask in normal words, e.g. “How has my activity changed this week?”, or reply to any card with “Explain this”.
+Ask in normal words, e.g. “Does caffeine at 4pm affect sleep?”. Short follow-ups (“how much is too much?”, “who was the lender?”) continue the last card; or reply to any card directly.
+Research answers quote NIH MedlinePlus and PubMed reviews with numbered sources; no AI model writes them.
 
 /brief – today's short overview
 /health – your data, coverage and trends
@@ -97,6 +140,7 @@ Ask in normal words, e.g. “How has my activity changed this week?”, or reply
 /property – recent recorded property documents
 /quant – simulation summary
 /focus – what to include in briefs · /settings – time, quiet hours
+/profile – what I know about you (confirm or remove)
 /glossary deed – plain-English terms
 /sources · /status (operator view) · /privacy · /forget · /cancel
 
@@ -108,7 +152,8 @@ PRIVACY = """<b>Privacy, plainly</b>
 • This bot uses no hosted AI model for your health data. Answers are computed on the Dell from fixed rules and vetted sources.
 • Only your numeric Telegram account, in a private chat, is answered. Anyone else is ignored.
 • Logs record timing and errors, not your messages or health values.
-• For questions outside the vetted list, up to 3 topic keywords (e.g. “caffeine sleep”, never your numbers or the full question) are sent to NIH's MedlinePlus search. Turn this off with <code>/settings research off</code>.
+• For questions outside the vetted list, up to 3 topic keywords (e.g. “caffeine sleep”; never your numbers, profile or the full question) are sent to NIH's MedlinePlus and PubMed search services. Property follow-ups query NYC Open Data by document or lot number (public records). Turn the health lookups off with <code>/settings research off</code>.
+• No AI model writes answers. Hermes's Gemini model is never used for your questions here.
 • /forget deletes this assistant's local data (preferences, focus list, card history, saved questions). It does not delete your phone's Health data, the Dell's imported health.db, or messages already in Telegram (delete those in the app)."""
 
 
@@ -198,6 +243,7 @@ def health_summary(conn=None, now=None) -> Reply:
     snap = {"coverage": {k: (str(v) if k == "last_import" else v) for k, v in cov.items()},
             "full": full.isoformat() if full else None,
             "partial": partial.isoformat() if partial else None}
+    lines.append(footer(snap_health(cov)))
     return Reply("\n".join(lines), domain="health", ref={"kind": "summary"}, snapshot=snap,
                  actions=[("Explain numbers", "explain_health", ""),
                           ("Steps 7d", "trend", "step_count:7"),
@@ -239,25 +285,25 @@ def explain_health(conn=None, now=None) -> Reply:
             if f.value is not None:
                 lines.append("• " + esc(hf.describe(f, True)))
         lines.append("")
-    return Reply("\n".join(lines) + EXPLAIN_HEALTH, domain="health", ref={"kind": "explain"})
+    return Reply("\n".join(lines) + EXPLAIN_HEALTH + footer(snap_health(cov)), domain="health",
+                 ref={"kind": "explain"})
 
 
 SYNC_HELP = """<b>Turn on sleep and workout exports</b>
-Data reaches the Dell only when the iPhone app <b>Health Auto Export</b> sends it (over Tailscale). Nothing is live.
+Data reaches the Dell only when the iPhone app <b>Health Auto Export</b> sends it (over Tailscale). Nothing is live. Labels below are from the app's help pages (updated Aug 23, 2026); your app version may word them slightly differently.
 
 <b>Sleep</b>
-1. Apple Watch: set up a sleep schedule (Health app → Browse → Sleep), turn on <b>Track Sleep with Apple Watch</b> (Watch app on iPhone → Sleep), and wear the watch to bed. Without that there is nothing to export.
-2. Health Auto Export → Automations → your REST API automation → Data Type: Health Metrics → Select Metrics → enable <b>Sleep Analysis</b> (keep your current metrics on).
-3. Keep “Aggregate data: by day” (sleep is still sent as nightly sessions).
+1. Set a sleep schedule (Health app → Browse → Sleep) and turn on <b>Track Sleep with Apple Watch</b> (Watch app on iPhone → Sleep). Wear the watch to bed.
+2. Health Auto Export → <b>Automations</b> → your REST API automation (Data Type: <b>Health Metrics</b>) → <b>Select Health Metrics</b> → add <b>Sleep Analysis</b>. Keep the metrics you already send.
+3. Keep <b>Summarize Data</b> ON with <b>Time Grouping</b> = Day (that is how your current export is set).
 
-<b>Workouts</b>
-4. Same app → Automations → add (or edit) a REST API automation with Data Type <b>Workouts</b>, same URL and the same Authorization header as your Health Metrics automation.
-5. Start workouts on the watch (Workout app → e.g. Kickboxing or Functional Strength) so they exist in Apple Health.
+<b>Workouts</b> (one data type per automation)
+4. <b>New Automation</b> → REST API → Data Type <b>Workouts</b>. Use the same URL and the same <b>Authorization</b> header (Add Headers) as the Health Metrics one. Export Version 2 is fine (the Dell reads v1 and v2).
+5. Record workouts on the watch (Workout app → e.g. Kickboxing, Functional Strength Training).
 
 <b>Check it worked</b>
-6. In each automation tap <b>Manual Export</b>, choose the last 7 days, and send.
-7. Here, send /health. The card should no longer say “no sleep data” / “no workouts”, and “Latest export” should show the time you just sent. /status shows the same thing from the Dell's side.
-Background exports only run when iOS allows; opening the app now and then helps."""
+6. In each automation tap <b>Manual Export</b> for the last 7 days.
+7. Send /health here. “Latest export” should show that time, and “no sleep data” / “no workouts” should disappear. /status shows counts from the Dell's side. If it doesn't change within a minute, tell me: I can check the receiver log for the request."""
 
 
 def sync_help() -> Reply:
@@ -285,6 +331,7 @@ def trend(metric, days, conn=None, now=None) -> Reply:
            + (f", {partial} partial (light bar)" if partial else "") + ".")
     if not have:
         cap += "\nNothing to chart yet."
+    cap += footer(snap_health(hf.coverage(conn, now)))
     other = 30 if days == 7 else 7
     return Reply(cap, photo=png, domain="health", ref={"kind": "trend", "metric": metric,
                                                        "days": days},
@@ -398,7 +445,7 @@ This topic won't appear in your daily briefs unless you add it yourself."""
                           ("Pelvic floor: evidence", "sources", "pelvic")])
 
 
-def mobility(profile_text="") -> Reply:
+def mobility(confirmed=None) -> Reply:
     intro = ("<b>Comfortable walking + ankle, knee and hip mobility</b>\n"
              "I read “goota” as <b>GOATA</b>, the gait/movement coaching system. If you meant "
              "something else, tell me.\n\n"
@@ -406,7 +453,7 @@ def mobility(profile_text="") -> Reply:
              "controlled trials of GOATA itself (searched Oct 6, 2026). General strength, balance "
              "and mobility work has much better support. There's no single correct foot angle or "
              "gait for everyone, and I found no evidence that any routine “realigns” bones.\n\n")
-    plan = workouts.render("mobility10", workouts.profile_notes(profile_text))
+    plan = workouts.render("mobility10", workouts.profile_notes(confirmed or {}, "mobility10"))
     return Reply(intro + plan, domain="health", ref={"kind": "workout", "plan": "mobility10"},
                  actions=[("Done", "fb", "done"), ("Too easy", "fb", "easy"),
                           ("Too hard", "fb", "hard"), ("Skip", "fb", "skip"),
@@ -414,12 +461,12 @@ def mobility(profile_text="") -> Reply:
                           ("Add mobility to brief", "focus_propose", "mobility")])
 
 
-def workout(plan_id="strength15", profile_text="") -> Reply:
-    text = workouts.render(plan_id, workouts.profile_notes(profile_text))
+def workout(plan_id="strength15", confirmed=None) -> Reply:
+    text = workouts.render(plan_id, workouts.profile_notes(confirmed or {}, plan_id))
     return Reply(text, domain="health", ref={"kind": "workout", "plan": plan_id},
                  actions=[("Done", "fb", "done"), ("Too easy", "fb", "easy"),
                           ("Too hard", "fb", "hard"), ("Skip", "fb", "skip"),
-                          ("Remind me later", "fb", "later")])
+                          ("Shorter version", "w_short", plan_id), ("My profile", "profile", "")])
 
 
 def load_profile():
@@ -472,15 +519,16 @@ def property_card(item, conn=None, now=None) -> Reply:
     for c in f["caveats"]:
         lines.append("⚠️ " + esc(c))
     lines.append("<b>Unknown:</b> " + esc("; ".join(f["unknown"])) + ".")
+    lines.append(footer(snap_property(conn)))
     links = [("Official ACRIS record", f["acris_url"])] if f["acris_url"] else []
     if f["zola_url"]:
         links.append(("Lot on ZoLa map", f["zola_url"]))
     return Reply("\n".join(lines), domain="property",
                  ref={"kind": "acris_item", "item_id": item["id"], "doc_id": f["doc_id"]},
                  snapshot=f, links=links,
-                 actions=[("Explain this", "p_explain", ""), ("Sale or loan?", "p_saleloan", ""),
-                          ("Building facts", "p_building", ""), ("Score?", "p_score", ""),
-                          ("Save", "p_save", ""), ("Dismiss", "p_dismiss", "")])
+                 actions=[("Explain this", "p_explain", ""), ("Who are the parties?", "p_parties", ""),
+                          ("Lot history", "p_history", ""), ("Building facts", "p_building", ""),
+                          ("Score?", "p_score", ""), ("Save", "p_save", ""), ("Dismiss", "p_dismiss", "")])
 
 
 def property_explain(f: dict) -> Reply:
@@ -538,7 +586,29 @@ def property_building(f: dict) -> Reply:
     return Reply("\n".join(lines), domain="property")
 
 
+def acris_code_reply(term: str):
+    """Answer 'what is a <document type>' from the official ACRIS code table."""
+    from core import property_live as L
+    t = (term or "").strip().lower()
+    for code, (desc, p1, p2) in L.CODES.items():
+        if t and (t == code.lower() or t == (desc or "").lower()):
+            generic = {"party 1", "party one", "party 2", "party two", ""}
+            roles = (f" Party 1 is the {p1.lower()}; party 2 is the {p2.lower()}."
+                     if (p1 or "").lower() not in generic and (p2 or "").lower() not in generic else
+                     " Its parties are just labelled “party 1” and “party 2”.")
+            return Reply(f"<b>{esc(desc.capitalize())}</b> (ACRIS code {esc(code)})\n"
+                         f"This is one of NYC's official categories for a recorded document.{esc(roles)} "
+                         "The category name is all the index says: what the document actually covers is "
+                         "only in the document image (the “Official ACRIS record” link on a card).",
+                         domain="property", links=[("ACRIS document codes (official)",
+                                                    "https://data.cityofnewyork.us/d/7isb-wh4c")])
+    return None
+
+
 def glossary_reply(term: str) -> Reply:
+    code = acris_code_reply(term)
+    if code and not pf.glossary(term or ""):
+        return code
     t = pf.glossary(term or "")
     if not t:
         return Reply("Terms I can explain: " + ", ".join(sorted(pf.GLOSSARY)) +
@@ -587,7 +657,7 @@ def quant_summary(conn=None, now=None) -> Reply:
     lines = [f"📈 <b>Quant — {esc(mode.upper())}</b> (no broker, no real money)" if mode == "simulation"
              else f"📈 <b>Quant — {esc(mode)}</b>",
              f"Simulated account since {a['since'][:10]}: start ${a['start']:,.2f} → equity "
-             f"${a['equity']:,.2f} ({a['total_return_pct']:+.2f}%) as of {a['as_of'][11:16]} UTC.",
+             f"${a['equity']:,.2f} ({a['total_return_pct']:+.2f}%).",
              f"= realized {sd(a['realized'])} ({a['n_closed']} closed) "
              f"+ unrealized {sd(a['unrealized'])} ({a['n_open']} open)"
              + (f" {sd(a['residual'])} unexplained cash difference" if abs(a['residual']) >= 0.01 else ""),
@@ -596,8 +666,10 @@ def quant_summary(conn=None, now=None) -> Reply:
         lines.append(f"Last 24 h: {sd(ch)} equity change.")
     lines.append("<i>Simulation limits: fills at the last quoted price; fees, spreads and slippage "
                  "are not modelled. Treat this as a test of the rules, not an estimate of live results.</i>")
+    lines.append(footer(snap_quant(a)))
     return Reply("\n".join(lines), domain="quant", ref={"kind": "summary"}, snapshot=a,
-                 actions=[("Open positions", "q_positions", ""), ("How return is calculated", "q_calc", ""),
+                 actions=[("Open positions", "q_positions", ""), ("What changed (24 h)", "q_changes", ""),
+                          ("How return is calculated", "q_calc", ""),
                           ("Risks & missing assumptions", "q_risks", "")])
 
 
@@ -627,11 +699,12 @@ def quant_positions(conn=None) -> list[Reply]:
     out = []
     for p in qf.open_positions(conn)[:6]:
         t = (f"<b>{esc(p['asset'])}</b> simulated long, ${p['notional']:,.0f} at {p['entry_price']:,.2f} "
-             f"({p['entry_ts'][:16].replace('T', ' ')} UTC)\nRule: {esc(p['rule'])}"
+             f"({et_iso(p['entry_ts'])})\nRule: {esc(p['rule'])}"
              + (f"; stop {p['stop']:,.2f}, target {p['target']:,.2f}" if p["stop"] and p["target"] else "")
-             + (f"; closes by {p['max_exit_ts'][:16].replace('T', ' ')} UTC" if p["max_exit_ts"] else ""))
+             + (f"; closes by {et_iso(p['max_exit_ts'])}" if p["max_exit_ts"] else ""))
         out.append(Reply(t, domain="quant", ref={"kind": "position", "position_id": p["id"]},
-                         snapshot=p, actions=[("Why opened?", "q_why", "")]))
+                         snapshot=p, actions=[("Why opened?", "q_why", ""),
+                                              ("How has this rule done?", "q_rule", p["rule"])]))
     if not out:
         out.append(Reply("No open simulated positions.", domain="quant"))
     return out
@@ -647,7 +720,7 @@ def quant_why(position_id: int, conn=None) -> Reply:
              f"<b>Observed (decision record):</b> rule <code>{esc(p['rule'])}</code> fired"]
     if w["signal"]:
         s = w["signal"]
-        lines.append(f"on a {esc(s['source'])} signal seen {esc((s['seen_ts'] or s['ts'] or '')[:16])} UTC:")
+        lines.append(f"on a {esc(s['source'])} signal seen {esc(et_iso(s['seen_ts'] or s['ts']))}:")
         lines.append(f"“{esc((s['text'] or '')[:220])}”")
     if w["rule_meaning"]:
         lines.append(f"<b>Rule hypothesis:</b> {esc(w['rule_meaning'])}.")
@@ -661,16 +734,29 @@ def quant_why(position_id: int, conn=None) -> Reply:
         lines.append("⚠️ " + esc(w["warning"]))
     lines.append("<i>A headline shows that something was reported, not that it's true or that it moved the price.</i>")
     links = [("Signal source", w["signal"]["url"])] if w["signal"] and w["signal"].get("url") else []
-    return Reply("\n".join(lines), domain="quant", links=links)
+    return Reply("\n".join(lines), domain="quant", links=links,
+                 ref={"kind": "position", "position_id": p["id"]}, snapshot={"rule": p["rule"], "id": p["id"]},
+                 actions=[("How has this rule done?", "q_rule", p["rule"])])
 
 
 # ── researched answers (novel questions) ──────────────────────────────
 
 PERSONAL_HOOKS = [
-    (("sleep", "insomnia", "caffeine", "nap", "tired"), "sleep"),
-    (("sit", "sitting", "inactive", "walk", "walking", "steps", "exercise", "activity",
-      "protein", "creatine", "muscle", "cardio"), "activity"),
+    (("sleep", "insomnia", "caffeine", "nap", "tired", "melatonin"), "sleep"),
+    (("sit", "sitting", "inactive", "walk", "walking", "steps", "exercise", "exercises", "activity",
+      "protein", "creatine", "muscle", "cardio", "stretching", "strength"), "activity"),
     (("heart", "pulse", "hrv", "blood", "pressure", "stress", "anxiety"), "heart"),
+]
+
+# What would be needed to make a general answer personal, by topic word.
+MISSING = [
+    (("caffeine", "coffee", "energy"), "how much caffeine you have and when (not tracked anywhere)"),
+    (("protein", "creatine", "supplement", "supplements", "vitamin", "diet"),
+     "your diet and supplement use (not tracked), and any medicines or conditions"),
+    (("knee", "ankle", "hip", "back", "pain", "injury", "joint", "joints"),
+     "whether there is pain, swelling or a past injury (tell me, or see a clinician if there is)"),
+    (("blood", "pressure"), "blood-pressure readings (none in your export)"),
+    (("sleep", "insomnia", "melatonin", "nap"), "sleep records (enable Sleep Analysis; /health → Sync help)"),
 ]
 
 
@@ -688,48 +774,259 @@ def _personal_lines(kws, conn, now):
         for m in ("step_count", "apple_exercise_time"):
             f = hf.fact(conn, m, full, cov["last_import"])
             if f.value is not None:
-                out.append(hf.describe(f, cov["days"] >= 7))
+                out.append(f"{full.strftime('%a %b %d')}: " + hf.describe(f, cov["days"] >= 7))
     if full and "heart" in want:
         for m in ("resting_heart_rate", "heart_rate_variability"):
             f = hf.fact(conn, m, full, cov["last_import"])
             if f.value is not None:
-                out.append(hf.describe(f, cov["days"] >= 7))
+                out.append(f"{full.strftime('%a %b %d')}: " + hf.describe(f, cov["days"] >= 7))
     if out and cov["days"] < 7:
-        out.append(f"Only {cov['days']} day(s) of history, so this can't show a personal pattern yet.")
+        out.append(f"Only {cov['days']} day(s) of history, so this can't show a personal pattern.")
+    if out:
+        out.append(snap_health(cov))
     return out
 
 
-def research_answer(question, store_conn=None, online=True, now=None, opener=None) -> Reply:
+def _missing(kws):
+    return [txt for words, txt in MISSING if any(k in words for k in kws)][:2]
+
+
+ASPECT_WORDS = {"dose": "how much", "safety": "safety", "timing": "timing", "efficacy": "whether it works"}
+
+
+def research_answer(question, store_conn=None, online=True, now=None, opener=None,
+                    kws=None, asp=None, context=None) -> Reply:
     from surfaces import research
     now = now or _now()
-    r = research.lookup(question, store_conn, online=online, opener=opener, now=now.timestamp())
+    r = research.lookup(question, store_conn, online=online, opener=opener, now=now.timestamp(),
+                        kws=kws, asp=asp)
     kws = r["keywords"]
     try:
         mine = _personal_lines(kws, health_conn(), now)
     except Exception:
         mine = []
-    if r.get("status") != "ok" or not r["sources"]:
-        why = {"none": "I couldn't find an NIH MedlinePlus topic that matches",
-               "offline": "The research source couldn't be reached right now, and nothing is cached for",
+    ref = {"kind": "research", "status": r.get("status"), "keywords": kws, "aspect": r.get("aspect")}
+    if r.get("status") != "ok":
+        why = {"none": "I couldn't find a matching source (NIH MedlinePlus or a PubMed review) for",
+               "offline": "The research sources couldn't be reached right now, and nothing is cached for",
                "disabled": "Online research is off (/settings research on), and nothing is cached for"
                }.get(r.get("status"), "I have nothing vetted on")
         text = (f"{why} “{esc(' '.join(kws) or question[:40])}”, so I won't guess. "
                 "I saved the question locally for follow-up research.")
         if mine:
             text += "\n\n<b>Your data that might matter:</b>\n" + "\n".join("• " + esc(x) for x in mine)
-        return Reply(text, domain="research", ref={"kind": "research", "status": r.get("status")})
-    lines = [f"<b>Researched answer</b> (keywords sent: “{esc(' '.join(kws))}”)",
-             f"<b>General evidence</b>: NIH MedlinePlus, retrieved {esc(r.get('retrieved') or '')}"
-             + (" (cached)" if r.get("cached") else "") + ". These are the source's own sentences:"]
-    links = []
-    for src in r["sources"]:
-        lines.append(f"<b>{esc(src['title'])}</b>")
-        lines += [f"“{esc(q)}”" for q in src["quotes"]]
-        links.append((src["title"][:36], src["url"]))
+        return Reply(text, domain="research", ref=ref)
+    focus = f" — focusing on {ASPECT_WORDS[r['aspect']]}" if r.get("aspect") else ""
+    ctx = f" (follow-up on “{esc(context)}”)" if context else ""
+    broad = ""
+    if r.get("broadened_from"):
+        broad = (f"\n<i>Nothing matched “{esc(' '.join(r['broadened_from']))}” together, so I broadened "
+                 f"the search to “{esc(' '.join(kws))}”. The sources below are about that, not the "
+                 f"exact combination.</i>")
+    lines = [f"<b>Researched answer: {esc(' + '.join(kws))}</b>{focus}{ctx}{broad}",
+             "<b>What the sources say</b> <i>(quoted; [n] = source)</i>"]
+    lines += [f"• “{esc(p['text'])}” [{p['n']}]" for p in r["points"]]
+    if r.get("gap"):
+        lines.append(f"<b>Gap:</b> none of the retrieved sources directly addresses "
+                     f"{ASPECT_WORDS.get(r['gap'], r['gap'])}. I won't fill that in.")
+    if r["uncertainty"]:
+        lines.append("<b>Uncertainty the sources state</b>")
+        lines += [f"• “{esc(u['text'])}” [{u['n']}]" for u in r["uncertainty"]]
+    pops = [(i, s["population"]) for i, s in enumerate(r["sources"], 1) if s.get("population")]
+    if pops:
+        lines.append("<b>Who was studied:</b> " + "; ".join(f"[{i}] {esc(p)}" for i, p in pops)
+                     + ". Results may not apply to a healthy college student.")
     if mine:
-        lines += ["", "<b>Your data</b>"] + ["• " + esc(x) for x in mine]
-    lines += ["", "<i>Interpretation: these pages describe the topic in general and were matched by "
-              "keyword, not reviewed for your situation. For supplements, medicines or symptoms, ask a "
-              "clinician or pharmacist.</i>"]
-    return Reply("\n".join(lines), domain="research", ref={"kind": "research"},
-                 snapshot={"keywords": kws, "sources": r["sources"]}, links=links)
+        lines += ["<b>Your data</b>"] + ["• " + esc(x) for x in mine]
+    miss = _missing(kws)
+    if miss:
+        lines.append("<b>Missing to personalise:</b> " + esc("; ".join(miss)) + ".")
+    lines.append("<b>Sources</b>")
+    for i, s_ in enumerate(r["sources"], 1):
+        kind = "consumer guidance" if s_["kind"] == "guidance" else s_["kind"]
+        lines.append(f"[{i}] <a href=\"{esc(s_['url'])}\">{esc(s_['title'][:90])}</a> — "
+                     f"{esc(s_['org'])}, {kind}")
+    how = ("live retrieval" if not r.get("cached") else "cached retrieval") + \
+        f" ({esc(', '.join(r.get('retrieval') or []))}, {esc(r.get('retrieved') or '')})"
+    lines.append(f"<i>How this was made: {how}; sentences chosen and ordered by fixed rules, "
+                 f"no AI model; no web search. Sent out: “{esc(' '.join(r.get('broadened_from') or kws))}”"
+                 + (f", then “{esc(' '.join(kws))}”" if r.get("broadened_from") else "") + " only.</i>")
+    links = [(f"[{i}] " + s_["title"][:34], s_["url"]) for i, s_ in enumerate(r["sources"], 1)]
+    return Reply("\n".join(lines), domain="research", ref=ref,
+                 snapshot={"keywords": kws, "sources": r["sources"]}, links=links,
+                 actions=[("How much?", "r_aspect", "dose"), ("Is it safe?", "r_aspect", "safety"),
+                          ("Timing?", "r_aspect", "timing"), ("Does it work?", "r_aspect", "efficacy")])
+
+
+# ── property follow-ups (live public records) ─────────────────────────
+
+def property_parties(f: dict, opener=None) -> Reply:
+    from core import property_live as L
+    try:
+        p = L.parties(f["doc_id"], f["doc_type"], opener=opener)
+    except Exception as exc:
+        return Reply(f"I couldn't reach NYC's ACRIS parties dataset just now ({type(exc).__name__}). "
+                     "The official record link on the card lists them too.", domain="property")
+    r1, r2 = p["roles"]
+
+    def names(lst):
+        merged = []
+        for x in lst:          # ACRIS splits long names across rows ("OF THE CITY OF ...", "F/K/A ...")
+            if merged and re.match(r"^(OF |F/K/A|A/K/A|D/B/A|AS |AND |&|INC\b|LLC\b|L\.?P\.?\b)", x["name"]):
+                merged[-1] = dict(merged[-1], name=merged[-1]["name"] + " " + x["name"])
+            else:
+                merged.append(x)
+        lst = merged
+        return "; ".join(f"{esc(x['name'])}" + (f" ({esc(x['city'])})" if x["city"] else "")
+                         for x in lst) or "none listed"
+    lines = [f"<b>Parties on this {esc(L.type_name(f['doc_type']))}</b> (official ACRIS index)",
+             f"<b>{esc(r1.capitalize())}:</b> {names(p['party1'])}",
+             f"<b>{esc(r2.capitalize())}:</b> {names(p['party2'])}"]
+    if f["doc_type"] == "MTGE":
+        lines.append("<i>Note: names are as filed. Borrowers are often single-purpose companies, and a "
+                     "\"c/o\" address can be a manager rather than the owner.</i>")
+    lines.append(footer("Live lookup of NYC Open Data dataset 636b-3b5g, just now"))
+    return Reply("\n".join(lines), domain="property", ref={"kind": "acris_item", "doc_id": f["doc_id"]},
+                 snapshot=f, links=[("Parties data (official)", p["source"])])
+
+
+def property_history(f: dict, opener=None) -> Reply:
+    from core import property_live as L
+    bbl = f.get("bbl")
+    if not bbl or len(str(bbl)) != 10:
+        return Reply("This record has no usable lot number (BBL), so I can't look up its history.",
+                     domain="property")
+    try:
+        h = L.lot_history(bbl, opener=opener)
+    except Exception as exc:
+        return Reply(f"I couldn't reach NYC's ACRIS datasets just now ({type(exc).__name__}).",
+                     domain="property")
+    lines = [f"<b>Recorded history of this lot</b> (BBL {esc(bbl)})",
+             f"{h['total']} documents since {esc(h['first'] or '?')}. Most common: " +
+             esc(", ".join(f"{L.type_name(k)} ×{v}" for k, v in sorted(h['counts'].items(),
+                                                                     key=lambda kv: -kv[1])[:5])),
+             "<b>Most recent</b>"]
+    same_day = {}
+    for d in h["recent"][:8]:
+        day = (d.get("recorded_datetime") or "")[:10]
+        amt = float(d.get("document_amt") or 0)
+        same_day.setdefault(day, set()).add(d.get("doc_type"))
+        lines.append(f"• {esc(day)} — {esc(L.type_name(d.get('doc_type')))}"
+                     + (f", {pf.money(amt)}" if amt else ""))
+    rec = (f.get("recorded") or "")[:10]
+    group = same_day.get(rec, set())
+    if {"MTGE", "SAT"} <= group or {"MTGE", "ASST"} <= group:
+        lines.append("<b>Interpretation (not proof):</b> a new mortgage recorded the same day as an "
+                     "old-mortgage satisfaction/assignment usually indicates a refinancing. The "
+                     "records alone don't show the reason or terms.")
+    deeds = h.get("deeds") or [d for d in h["recent"] if d.get("doc_type") in ("DEED", "DEEDO")]
+    earlier = [d for d in deeds if d.get("document_id") != f.get("doc_id")]
+    if earlier:
+        lines.append("Earlier ownership transfers (deeds): " + esc(", ".join(
+            (d.get("recorded_datetime") or "")[:10] + (f" {pf.money(float(d.get('document_amt') or 0))}"
+                                                     if float(d.get("document_amt") or 0) else "")
+            for d in earlier[:4])) + ".")
+    else:
+        lines.append(f"No earlier deed on this lot in the city index (records start {esc(h['first'] or '?')}).")
+    if f.get("doc_type") in ("DEED", "DEEDO") and len(f.get("caveats") or []) and \
+            any("parcels" in c for c in f["caveats"]):
+        lines.append("<i>This deed covers several lots; this history is for one of them.</i>")
+    lines.append(footer("Live lookup of NYC Open Data (ACRIS legals + master), just now; "
+                        "NYC's feed has published nothing recorded after its newest date"))
+    return Reply("\n".join(lines), domain="property", ref={"kind": "acris_item", "doc_id": f.get("doc_id")},
+                 snapshot=f, links=[("Lot documents (official)", h["source"])])
+
+
+# ── quant follow-ups ──────────────────────────────────────────────────
+
+def quant_changes(conn=None, now=None) -> Reply:
+    conn = conn or eventbot_conn()
+    now = now or _now()
+    since = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    opened = conn.execute("SELECT id, asset, rule, notional FROM positions WHERE entry_ts >= ? "
+                          "ORDER BY entry_ts", (since,)).fetchall()
+    closed = conn.execute("SELECT id, asset, rule, pnl, exit_reason FROM positions WHERE status='closed' "
+                          "AND exit_ts >= ? ORDER BY exit_ts", (since,)).fetchall()
+    a = qf.accounting(conn)
+    ch = qf.change_24h(conn, now)
+    lines = ["<b>What changed in the simulation (last 24 h)</b>",
+             f"Equity change: {sd(ch) if ch is not None else 'unknown'}.",
+             f"Opened {len(opened)}: " + (esc(", ".join(f"#{r[0]} {r[1]} ({r[2]})" for r in opened)) or "none"),
+             f"Closed {len(closed)}: " + (esc(", ".join(f"#{r[0]} {r[1]} {sd(r[3] or 0)} ({r[4]})"
+                                                       for r in closed)) or "none")]
+    if closed:
+        lines.append(f"Realized from those closes: {sd(sum(r[3] or 0 for r in closed))}.")
+    lines.append(footer(snap_quant(a)))
+    return Reply("\n".join(lines), domain="quant")
+
+
+def quant_rule(rule: str, conn=None) -> Reply:
+    conn = conn or eventbot_conn()
+    rows = conn.execute("SELECT pnl, exit_reason FROM positions WHERE rule=? AND status='closed'",
+                        (rule,)).fetchall()
+    n = len(rows)
+    lines = [f"<b>Rule <code>{esc(rule)}</code>: simulated track record</b>"]
+    if not n:
+        lines.append("No closed simulated trades for this rule yet, so there is no track record.")
+    else:
+        wins = sum(1 for p, _ in rows if (p or 0) > 0)
+        total = sum(p or 0 for p, _ in rows)
+        reasons = {}
+        for _, r in rows:
+            reasons[r] = reasons.get(r, 0) + 1
+        lines += [f"Closed trades: {n}; profitable: {wins} ({100 * wins / n:.0f}%); total P&L {sd(total)}; "
+                  f"average {sd(total / n)} per trade.",
+                  "Exit reasons: " + esc(", ".join(f"{k} ×{v}" for k, v in reasons.items())) + "."]
+        if n < 30:
+            lines.append(f"<i>{n} trade{'' if n == 1 else 's'} is a small sample; this record says little about future results.</i>")
+    lines.append("<i>Simulation only: no fees or slippage modelled.</i>")
+    return Reply("\n".join(lines), domain="quant")
+
+
+ASSET_ALIASES = {"gold": "GLD", "gld": "GLD", "bitcoin": "BTC-USD", "btc": "BTC-USD",
+                 "ethereum": "ETH-USD", "eth": "ETH-USD", "ether": "ETH-USD", "djt": "DJT",
+                 "trump media": "DJT", "sh": "SH", "short s&p": "SH", "inverse s&p": "SH"}
+
+
+def find_position(text, conn=None):
+    """Open simulated position named in free text (by symbol or common name), else None."""
+    conn = conn or eventbot_conn()
+    t = " " + text.lower() + " "
+    opens = qf.open_positions(conn)
+    for word, sym in ASSET_ALIASES.items():
+        if f" {word} " in t or f" {word}?" in t or f" {word}," in t:
+            for p in opens:
+                if p["asset"] == sym:
+                    return p
+    for p in opens:
+        if p["asset"].lower().split("-")[0] in re.findall(r"[a-z]+", t):
+            return p
+    return None
+
+
+ADDRESS_RE = re.compile(r"\b(\d{1,5}[a-z]?(?:-\d{1,5})?\s+(?:[a-z]+\s){0,3}?"
+                        r"(?:street|st|avenue|ave|place|pl|road|rd|boulevard|blvd|drive|dr|lane|ln|"
+                        r"broadway|parkway|pkwy|terrace|court|ct))\b", re.I)
+_ABBR = {"st": "street", "ave": "avenue", "pl": "place", "rd": "road", "blvd": "boulevard",
+         "dr": "drive", "ln": "lane", "pkwy": "parkway", "ct": "court"}
+
+
+def find_property(text, conn=None):
+    """Item in the store whose address matches one named in the text."""
+    m = ADDRESS_RE.search(text or "")
+    if not m:
+        return None
+    words = m.group(1).lower().split()
+    words = [_ABBR.get(w, w) for w in words]
+    num, rest = words[0], words[1:]
+    conn = conn or spine_conn()
+    for r in conn.execute("SELECT id, data_json FROM items WHERE source='acris' AND kind='deal'"):
+        try:
+            addr = (json.loads(r["data_json"]).get("address") or "").lower()
+        except Exception:
+            continue
+        aw = [_ABBR.get(w, w) for w in addr.replace(",", " ").split()]
+        if aw and (aw[0] == num or aw[0].startswith(num + "-") or aw[0].endswith("-" + num)) \
+                and all(w in aw for w in rest):
+            return pf.load_item(conn, r["id"])
+    return None

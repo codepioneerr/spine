@@ -513,7 +513,7 @@ class TestBot(Base):
         # offline: answered from cache
         self.app.research_opener = self._fake_fetch(None, seen)
         self.msg("Does caffeine affect my sleep? I slept 5 hours and my HRV was 58")
-        self.assertIn("(cached)", self.last())
+        self.assertIn("cached retrieval", self.last())
 
     def test_research_offline_and_disabled(self):
         self.app.research_opener = self._fake_fetch(None, [])

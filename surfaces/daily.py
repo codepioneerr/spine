@@ -35,8 +35,9 @@ _TERMS = ["deed", "mortgage", "bbl", "acris", "pluto", "grantor", "grantee", "as
 
 def focus_line(topic: str, day_index: int) -> str:
     if topic == "mobility":
-        n, dose, how, _ = workouts.MOVES[_MOB[day_index % len(_MOB)]]
-        return f"🧘 Mobility idea: <b>{esc(n)}</b>, {esc(dose)}. {esc(how.split('.')[0])}."
+        mv = workouts.MOVES[_MOB[day_index % len(_MOB)]]
+        return (f"🧘 Mobility idea: <b>{esc(mv.name)}</b>, {esc(mv.dose())}. "
+                f"{esc(mv.how.split('.')[0])}.")
     if topic == "walking":
         return "🚶 Walking: one 20-minute brisk walk today (counts toward 150 min/week)."
     if topic == "sleep consistency":
@@ -114,6 +115,27 @@ def quant_line(now):
             f"{a['since'][:10]}{c}. /quant")
 
 
+def snapshot_times(doms, now) -> list[str]:
+    """The same wording and source times the domain cards use (assistant.snap_*)."""
+    out = []
+    if "health" in doms:
+        try:
+            out.append(A.snap_health(hf.coverage(A.health_conn(), now)))
+        except Exception:
+            pass
+    if "quant" in doms:
+        try:
+            out.append(A.snap_quant(qf.accounting(A.eventbot_conn())))
+        except Exception:
+            pass
+    if "property" in doms:
+        try:
+            out.append(A.snap_property(A.spine_conn()))
+        except Exception:
+            pass
+    return out or ["no data sources available"]
+
+
 def build(store, now=None) -> Reply:
     now = now or datetime.now(timezone.utc)
     local = now.astimezone(hf.TZ)
@@ -139,6 +161,7 @@ def build(store, now=None) -> Reply:
         out += [""] + flines[:3]
     if notes:
         out += ["", "<i>Data note: " + esc(notes[0]) + "</i>"]
+    out.append(A.footer("; ".join(snapshot_times(doms, now))))
     store.set_pref("last_brief_ts", now.strftime("%Y-%m-%dT%H:%M:%SZ"))
     return Reply("\n".join(out), domain="brief", ref={"kind": "daily", "day": local.date().isoformat()},
                  actions=[("Health", "open", "health"), ("Property", "open", "property"),

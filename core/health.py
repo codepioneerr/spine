@@ -369,15 +369,20 @@ _STAGES = {"deep": "deep", "rem": "rem", "core": "core", "awake": "awake",
            "asleep": "core", "inbed": "inbed", "in bed": "inbed"}
 
 
+SESSION_GAP_MIN = 120   # stage segments further apart than this are separate sleeps
+
+
 def _sleep_rows(entries: list[dict], errors: list) -> list[tuple]:
     """Aggregated entries (totalSleep/deep/rem...) map one-to-one. Raw stage
-    segments (value + startDate/endDate) are summed into one session per
-    wake-up date, which is idempotent as long as the whole night is sent."""
-    rows, nights = [], defaultdict(lambda: defaultdict(float))
-    bounds: dict[str, list] = {}
+    segments (value + startDate/endDate) are clustered into continuous
+    sessions (gaps < SESSION_GAP_MIN) and keyed by the session's start, so a
+    night crossing midnight stays ONE night. (Grouping by each segment's own
+    end date split 23:00-00:30 into two "nights" - fixed 2026-10-06.)
+    Idempotent as long as the whole night is sent."""
+    rows, segs = [], []
     for e in entries:
         try:
-            if any(k in e for k in ("totalSleep", "asleep", "deep", "rem", "core")):
+            if any(k in e for k in ("totalSleep", "asleep", "deep", "rem", "core")) and "value" not in e:
                 r = _sleep_summary(e)
                 if r:
                     rows.append(r)
@@ -386,14 +391,20 @@ def _sleep_rows(entries: list[dict], errors: list) -> list[tuple]:
             s, t = _parse_ts(e.get("startDate")), _parse_ts(e.get("endDate"))
             if not stage or not s or not t:
                 continue
-            key = t.date().isoformat()
-            nights[key][stage] += (t - s).total_seconds() / 60
-            b = bounds.setdefault(key, [s, t])
-            b[0], b[1] = min(b[0], s), max(b[1], t)
+            segs.append((s, t, stage))
         except Exception as exc:
             errors.append(f"sleep_analysis: {type(exc).__name__}: {str(exc)[:80]}")
-    for key, st in nights.items():
-        s, t = bounds[key]
+    segs.sort(key=lambda x: x[0])
+    sessions: list[list] = []
+    for s, t, stage in segs:
+        if sessions and (s - sessions[-1][1]).total_seconds() / 60 <= SESSION_GAP_MIN:
+            cur = sessions[-1]
+            cur[1] = max(cur[1], t)
+        else:
+            cur = [s, t, defaultdict(float)]
+            sessions.append(cur)
+        cur[2][stage] += (t - s).total_seconds() / 60
+    for s, t, st in sessions:
         total = st["deep"] + st["rem"] + st["core"]
         in_bed = st["inbed"] or (total + st["awake"])
         eff = round(100 * total / in_bed, 1) if in_bed else None
