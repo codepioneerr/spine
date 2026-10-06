@@ -471,26 +471,26 @@ class TestSuppressedBreakdown(unittest.TestCase):
     def test_kinds_are_named_and_ordered_by_count(self):
         out = self._out({"signal": 1, "deal": 98, "fact": 24})
         line = [l for l in out.split(chr(10)) if l.startswith("+ ")][0]
-        self.assertIn("98 deals", line)
-        self.assertIn("24 positions", line)
-        self.assertIn("1 signal", line)
-        self.assertLess(line.index("98 deals"), line.index("24 positions"))
-        self.assertLess(line.index("24 positions"), line.index("1 signal"))
+        self.assertIn("98 property records", line)
+        self.assertIn("24 simulated positions", line)
+        self.assertIn("1 market move", line)
+        self.assertLess(line.index("98 property records"), line.index("24 simulated positions"))
+        self.assertLess(line.index("24 simulated positions"), line.index("1 market move"))
 
     def test_one_of_something_reads_singular(self):
         """1 signals is the kind of thing that makes a daily message feel
         unmaintained."""
         out = self._out({"signal": 1})
-        self.assertIn("1 signal", out)
-        self.assertNotIn("1 signals", out)
+        self.assertIn("1 market move", out)
+        self.assertNotIn("1 market moves", out)
 
     def test_many_stays_plural(self):
         out = self._out({"signal": 2})
-        self.assertIn("2 signals", out)
+        self.assertIn("2 market moves", out)
 
     def test_a_zero_count_is_not_listed(self):
         out = self._out({"deal": 5, "alert": 0})
-        self.assertIn("5 deals", out)
+        self.assertIn("5 property records", out)
         self.assertNotIn("alert", out.split("+ ")[-1])
 
     def test_no_breakdown_still_gives_a_bare_count(self):

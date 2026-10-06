@@ -26,7 +26,7 @@ Polymarket prices are public market data. Nothing here is Nick's.
 
 from __future__ import annotations
 
-from core import bridge, freshness
+from core import bridge, freshness, market_filter
 
 META = {
     "id": "polymarket",
@@ -112,9 +112,16 @@ def select(conn, since: str, min_volume: int, limit: int = MAX_ROWS):
     return conn.execute(SQL, (since, min_volume, limit)).fetchall()
 
 
-def build_items(rows) -> list[dict]:
+def build_items(rows, ends=None, now=None) -> list[dict]:
+    """`ends` is market_id -> end_date. Jumps on markets that have ended, or
+    that moved after their end time, are settlement, not signal: dropped."""
+    ends = ends or {}
     items = []
     for row in rows:
+        end = ends.get(str(row["market_id"]))
+        state = market_filter.status(end, row["ts"], now=now, new_price=row["new_price"])
+        if state in ("expired", "settling"):
+            continue
         items.append({
             "kind": "signal",
             "key": f"jump:{row['market_id']}:{row['ts']}",
@@ -131,6 +138,8 @@ def build_items(rows) -> list[dict]:
                 "volume24h": row["volume24h"],
                 "political": bool(row["political"]),
                 "jumped_at": row["ts"],
+                "end_date": end,
+                "market_state": state,
             },
         })
     return items
@@ -151,10 +160,11 @@ def run(ctx):
     try:
         newest = conn.execute("SELECT MAX(ts) FROM snapshots").fetchone()[0]
         rows = select(conn, since, min_volume)
+        ends = market_filter.end_dates(conn, [r["market_id"] for r in rows])
     finally:
         conn.close()
 
-    items = build_items(rows)
+    items = build_items(rows, ends, now=ctx.now)
     stale = freshness.stale_item(
         "polymarket", newest, ctx.now,
         bridge.env_int("SPINE_POLYMARKET_STALE_HOURS", STALE_HOURS), "market snapshot")

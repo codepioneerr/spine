@@ -53,9 +53,9 @@ KIND_ORDER = ("alert", "task", "deal", "signal", "fact")
 KIND_LABEL = {
     "alert": "ALERTS",
     "task": "TASKS",
-    "deal": "DEALS",
-    "signal": "SIGNALS",
-    "fact": "POSITIONS",
+    "deal": "PROPERTY RECORDS",
+    "signal": "MARKET MOVES",
+    "fact": "SIMULATED POSITIONS",
 }
 
 
