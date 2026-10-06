@@ -58,7 +58,10 @@ def run(ctx) -> dict:
         }
     finally:
         conn.close()
-MAX_BODY = 25 * 1024 * 1024  # a multi-month backfill is a few MB
+# Measured: a 5 MB body peaks at ~58 MB RSS (json + sqlite), against the
+# unit's MemoryMax=64M. Larger sends get 413 and the app's "batch requests"
+# option splits them, rather than an OOM kill mid-write.
+MAX_BODY = 4 * 1024 * 1024
 
 
 def load_token() -> str | None:
@@ -108,16 +111,30 @@ def make_handler(token: str, db_path: str | None = None):
                 length = -1
             if length <= 0 or length > MAX_BODY:
                 return self._reply(413 if length > MAX_BODY else 400,
-                                   {"error": "bad content length"})
+                                   {"error": "bad content length", "max_bytes": MAX_BODY,
+                                    "hint": "enable batch requests in Health Auto Export"})
+            body = self.rfile.read(length)
+            conn = health.connect(db_path)
             try:
-                payload = json.loads(self.rfile.read(length))
-                conn = health.connect(db_path)
+                # Raw first: whatever happens next, the bytes are kept and
+                # `python3 -m core.health --reprocess` can parse them later.
+                digest = health.store_raw(body, conn)
                 try:
+                    payload = json.loads(body)
+                    keys = sorted((payload.get("data") or payload).keys()) \
+                        if isinstance(payload, dict) and isinstance(payload.get("data", payload), dict) else []
                     counts = health.ingest(payload, conn)
-                finally:
-                    conn.close()
-            except (ValueError, UnicodeDecodeError) as exc:
-                return self._reply(400, {"error": f"bad payload: {exc}"})
+                except (ValueError, UnicodeDecodeError) as exc:
+                    return self._reply(400, {"error": f"bad payload: {exc}"})
+                except Exception as exc:  # never a 500: the raw copy is safe
+                    self.log_message("ingest crashed (raw kept %s): %s: %s",
+                                     digest[:12], type(exc).__name__, str(exc)[:200])
+                    return self._reply(202, {"ok": False, "stored_raw": digest,
+                                             "error": type(exc).__name__})
+            finally:
+                conn.close()
+            self.log_message("ingested keys=%s %s", ",".join(keys),
+                             json.dumps({k: v for k, v in counts.items() if v}))
             self._reply(200, {"ok": True, "upserted": counts})
 
         def log_message(self, fmt, *args):

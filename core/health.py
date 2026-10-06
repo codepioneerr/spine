@@ -7,37 +7,58 @@ belong in `items`. Keeping it in a separate file also means the most
 sensitive data on the box can be backed up, wiped or permissioned on its
 own.
 
-    daily_vitals(date PK, ...)       one row per calendar day
-    sleep_sessions(id PK, ...)       id = sleep start timestamp
-    workouts(id PK, ...)             id = the app's workout UUID
+The app has five export streams, all POSTed to the same route. Each is a
+key under `data`:
+
+    metrics         -> health_metric_samples (every point, any metric name)
+                       + daily_vitals and sleep_sessions (derived summaries)
+    workouts        -> workouts
+    symptoms        -> symptoms
+    ecg             -> ecg_recordings (voltages zlib-compressed)
+    stateOfMind     -> state_of_mind
+
+## Nothing is dropped, nothing 500s
+
+The raw body is stored (zlib, `raw_payloads`) BEFORE parsing, and parsing
+is per record: a record that does not parse is counted in `errors`, the rest
+of the payload still lands. Unknown top-level keys are counted as
+`unhandled` and survive in the raw copy, so a shape this code has never seen
+can be handled later with `python3 -m core.health --reprocess` rather than
+lost. Raw copies are pruned after RAW_RETENTION_DAYS.
+
+`health_metric_samples` is the extensible table: one row per (metric, ts,
+source) for every metric the app sends, including the sparse ones (gait,
+nutrition) that have no column anywhere. New metrics need no schema change.
 
 ## Idempotency, stated because it is the whole design
 
-The app re-sends overlapping windows on every sync. So every write is an
-upsert keyed on something stable across sends:
+The app re-sends overlapping windows on every sync. Every write is an upsert
+keyed on something stable across sends:
 
-  - vitals key on the date. Within one payload, samples for a day are
-    aggregated (sum for steps/energy, mean for the rest), and that aggregate
-    REPLACES the stored value. Re-sending a payload never double-counts.
-    Configure the app with "Aggregate data: by day" so each send carries
-    the whole day, not just a window of it.
-  - A metric absent from a payload leaves that column alone (COALESCE), so
-    a send carrying only steps does not null out yesterday's HRV.
-  - sleep keys on its start time; workouts on the app's id, falling back to
-    a hash of type + start for exports that omit it.
-
-Unknown metric names are ignored, not guessed at.
+  - samples on (metric, ts, source); vitals on the date. Within one payload a
+    day's samples are aggregated (sum for steps/energy, mean for the rest)
+    and that aggregate REPLACES the stored value — re-sending never
+    double-counts. Configure the app with "Aggregate data: by day".
+  - A metric absent from a payload leaves that vitals column alone
+    (COALESCE), so a send carrying only steps does not null out HRV.
+  - sleep on its start time; workouts on the app's id (else a hash of type +
+    start); symptoms on name + start; ECG on start; state of mind on its id.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
+import sys
+import zlib
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from core import paths
+
+RAW_RETENTION_DAYS = 30
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS daily_vitals (
@@ -70,9 +91,61 @@ CREATE TABLE IF NOT EXISTS workouts (
     avg_heart_rate      REAL,
     max_heart_rate      REAL
 );
+CREATE TABLE IF NOT EXISTS health_metric_samples (
+    metric      TEXT NOT NULL,
+    ts          TEXT NOT NULL,       -- ISO 8601 with the phone's offset
+    date        TEXT NOT NULL,       -- local calendar date of ts
+    source      TEXT NOT NULL DEFAULT '',
+    units       TEXT,
+    qty         REAL,
+    min         REAL,
+    avg         REAL,
+    max         REAL,
+    value_text  TEXT,                -- e.g. sleep stage name
+    extra_json  TEXT,                -- any other fields, verbatim
+    PRIMARY KEY (metric, ts, source)
+);
+CREATE INDEX IF NOT EXISTS samples_by_date ON health_metric_samples(date, metric);
+CREATE TABLE IF NOT EXISTS symptoms (
+    id          TEXT PRIMARY KEY,
+    name        TEXT,
+    start_time  TEXT,
+    end_time    TEXT,
+    severity    TEXT,
+    source      TEXT
+);
+CREATE TABLE IF NOT EXISTS ecg_recordings (
+    id                  TEXT PRIMARY KEY,
+    start_time          TEXT,
+    end_time            TEXT,
+    classification      TEXT,
+    severity            TEXT,
+    avg_heart_rate      REAL,
+    sampling_frequency  REAL,
+    sample_count        INTEGER,
+    source              TEXT,
+    voltages_zlib       BLOB         -- zlib(JSON list of [voltage...])
+);
+CREATE TABLE IF NOT EXISTS state_of_mind (
+    id                     TEXT PRIMARY KEY,
+    start_time             TEXT,
+    end_time               TEXT,
+    kind                   TEXT,
+    valence                REAL,
+    valence_classification TEXT,
+    labels_json            TEXT,
+    associations_json      TEXT
+);
+CREATE TABLE IF NOT EXISTS raw_payloads (
+    sha256       TEXT PRIMARY KEY,
+    received_at  TEXT NOT NULL,
+    bytes        INTEGER,
+    keys         TEXT,
+    body_zlib    BLOB
+);
 """
 
-# Health Auto Export metric name -> (column, aggregation within a day)
+# Health Auto Export metric name -> (daily_vitals column, aggregation)
 METRICS = {
     "step_count":                       ("step_count", "sum"),
     "active_energy":                    ("active_calories", "sum"),
@@ -85,6 +158,11 @@ METRICS = {
     "oxygen_saturation":                ("oxygen_saturation_avg", "mean"),
 }
 VITAL_COLUMNS = sorted({c for c, _ in METRICS.values()})
+_AGG = {c: a for c, a in METRICS.values()}
+
+STREAMS = ("metrics", "workouts", "symptoms", "ecg", "stateOfMind")
+_SAMPLE_FIELDS = {"date", "qty", "Min", "Avg", "Max", "min", "avg", "max",
+                  "source", "value", "units", "startDate", "endDate"}
 
 
 def db_path() -> str:
@@ -110,14 +188,15 @@ def connect(path: str | None = None) -> sqlite3.Connection:
 def _parse_ts(value) -> datetime | None:
     if not value or not isinstance(value, str):
         return None
+    v = value.strip()
     for fmt in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z",
                 "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
-            return datetime.strptime(value.strip(), fmt)
+            return datetime.strptime(v, fmt)
         except ValueError:
             continue
     try:
-        return datetime.fromisoformat(value.strip())
+        return datetime.fromisoformat(v.replace("Z", "+00:00"))
     except ValueError:
         return None
 
@@ -130,11 +209,9 @@ def _iso(value) -> str | None:
 def _num(value) -> float | None:
     """A number, or the `qty` of a {qty, units} object."""
     if isinstance(value, dict):
-        value = value.get("qty", value.get("Avg"))
-    if isinstance(value, bool):
+        value = value.get("qty", value.get("Avg", value.get("avg")))
+    if isinstance(value, bool) or value is None:
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -146,76 +223,187 @@ def _minutes(hours) -> float | None:
     return round(h * 60, 1) if h is not None else None
 
 
+def _hid(*parts) -> str:
+    return hashlib.sha1("|".join(str(p) for p in parts).encode()).hexdigest()[:16]
+
+
+def _list(data: dict, key: str) -> list:
+    v = data.get(key) or []
+    if not isinstance(v, list):
+        raise ValueError(f"data.{key} must be a list")
+    return v
+
+
+# ── raw store ────────────────────────────────────────────────────────
+
+def store_raw(body: bytes, conn: sqlite3.Connection, keys: str = "") -> str:
+    """Keep the exact bytes the phone sent. Returns the sha256."""
+    digest = hashlib.sha256(body).hexdigest()
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=RAW_RETENTION_DAYS)).isoformat()
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO raw_payloads VALUES (?,?,?,?,?)",
+            (digest, now.isoformat(), len(body), keys, zlib.compress(body, 6)))
+        conn.execute("DELETE FROM raw_payloads WHERE received_at < ?", (cutoff,))
+    return digest
+
+
 # ── ingestion ────────────────────────────────────────────────────────
 
 def ingest(payload: dict, conn: sqlite3.Connection) -> dict:
-    """Upsert one Health Auto Export payload. Returns counts per table.
-    Raises ValueError on a payload that is not the expected shape."""
+    """Upsert one Health Auto Export payload (any of the five streams).
+
+    Returns counts per table plus `errors` (records that failed to parse) and
+    `unhandled` (unknown top-level keys). Raises ValueError only when the
+    payload is not an object of the expected outer shape."""
     if not isinstance(payload, dict):
         raise ValueError("payload must be a JSON object")
     data = payload.get("data", payload)
     if not isinstance(data, dict):
         raise ValueError("payload.data must be an object")
-    metrics = data.get("metrics") or []
-    workouts = data.get("workouts") or []
-    if not isinstance(metrics, list) or not isinstance(workouts, list):
-        raise ValueError("metrics and workouts must be lists")
+    streams = {k: _list(data, k) for k in STREAMS}
 
-    samples: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
-    sleep_rows = []
-    for metric in metrics:
-        if not isinstance(metric, dict):
+    out = defaultdict(int)
+    errors: list[str] = []
+    unhandled = sorted(k for k in data if k not in STREAMS)
+
+    def guarded(label, fn, rec):
+        try:
+            return fn(rec)
+        except Exception as exc:  # one bad record never sinks the payload
+            errors.append(f"{label}: {type(exc).__name__}: {str(exc)[:80]}")
+            return None
+
+    samples, vitals_acc, sleep_rows = [], defaultdict(lambda: defaultdict(list)), []
+    for metric in streams["metrics"]:
+        if not isinstance(metric, dict) or not metric.get("name"):
+            errors.append("metrics: entry without a name")
             continue
-        name = metric.get("name")
+        name, units = str(metric["name"]), metric.get("units")
         entries = metric.get("data") or []
+        if not isinstance(entries, list):
+            errors.append(f"metrics.{name}: data is not a list")
+            continue
         if name == "sleep_analysis":
-            sleep_rows.extend(_sleep_row(e) for e in entries if isinstance(e, dict))
-            continue
-        if name not in METRICS:
-            continue
-        column, _ = METRICS[name]
+            rows = _sleep_rows([e for e in entries if isinstance(e, dict)], errors)
+            sleep_rows.extend(rows)
         for e in entries:
-            if not isinstance(e, dict):
+            row = guarded(f"metrics.{name}", lambda r: _sample_row(name, units, r), e)
+            if not row:
                 continue
-            ts = _parse_ts(e.get("date"))
-            qty = _num(e.get("qty", e.get("Avg")))
-            if ts is None or qty is None:
-                continue
-            samples[ts.date().isoformat()][column].append(qty)
+            samples.append(row)
+            if name in METRICS and row[5] is not None:
+                vitals_acc[row[2]][METRICS[name][0]].append(row[5])
 
-    aggregation = {c: a for c, a in METRICS.values()}
-    vitals = []
-    for day, cols in samples.items():
-        row = {c: None for c in VITAL_COLUMNS}
-        for col, vals in cols.items():
-            v = sum(vals) if aggregation[col] == "sum" else sum(vals) / len(vals)
-            row[col] = int(round(v)) if col == "step_count" else round(v, 3)
-        vitals.append((day, row))
-
-    sleep_rows = [r for r in sleep_rows if r]
-    workout_rows = [r for r in (_workout_row(w) for w in workouts if isinstance(w, dict)) if r]
+    workouts = [r for r in (guarded("workouts", _workout_row, w)
+                            for w in streams["workouts"]) if r]
+    symptoms = [r for r in (guarded("symptoms", _symptom_row, s)
+                            for s in streams["symptoms"]) if r]
+    ecgs = [r for r in (guarded("ecg", _ecg_row, e) for e in streams["ecg"]) if r]
+    moods = [r for r in (guarded("stateOfMind", _mood_row, m)
+                         for m in streams["stateOfMind"]) if r]
 
     with conn:
-        for day, row in vitals:
-            cols = ", ".join(VITAL_COLUMNS)
+        conn.executemany(
+            "INSERT OR REPLACE INTO health_metric_samples VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            samples)
+        for day, cols in vitals_acc.items():
+            row = {c: None for c in VITAL_COLUMNS}
+            for col, vals in cols.items():
+                v = sum(vals) if _AGG[col] == "sum" else sum(vals) / len(vals)
+                row[col] = int(round(v)) if col == "step_count" else round(v, 3)
+            cl = ", ".join(VITAL_COLUMNS)
             marks = ", ".join("?" for _ in VITAL_COLUMNS)
-            updates = ", ".join(f"{c} = COALESCE(excluded.{c}, {c})" for c in VITAL_COLUMNS)
+            upd = ", ".join(f"{c} = COALESCE(excluded.{c}, {c})" for c in VITAL_COLUMNS)
             conn.execute(
-                f"INSERT INTO daily_vitals (date, {cols}) VALUES (?, {marks}) "
-                f"ON CONFLICT(date) DO UPDATE SET {updates}",
+                f"INSERT INTO daily_vitals (date, {cl}) VALUES (?, {marks}) "
+                f"ON CONFLICT(date) DO UPDATE SET {upd}",
                 [day] + [row[c] for c in VITAL_COLUMNS])
-        for r in sleep_rows:
-            conn.execute(
-                "INSERT OR REPLACE INTO sleep_sessions VALUES (?,?,?,?,?,?,?,?,?)", r)
-        for r in workout_rows:
-            conn.execute(
-                "INSERT OR REPLACE INTO workouts VALUES (?,?,?,?,?,?,?)", r)
+        conn.executemany("INSERT OR REPLACE INTO sleep_sessions VALUES (?,?,?,?,?,?,?,?,?)", sleep_rows)
+        conn.executemany("INSERT OR REPLACE INTO workouts VALUES (?,?,?,?,?,?,?)", workouts)
+        conn.executemany("INSERT OR REPLACE INTO symptoms VALUES (?,?,?,?,?,?)", symptoms)
+        conn.executemany("INSERT OR REPLACE INTO ecg_recordings VALUES (?,?,?,?,?,?,?,?,?,?)", ecgs)
+        conn.executemany("INSERT OR REPLACE INTO state_of_mind VALUES (?,?,?,?,?,?,?,?)", moods)
 
-    return {"daily_vitals": len(vitals), "sleep_sessions": len(sleep_rows),
-            "workouts": len(workout_rows)}
+    out.update(health_metric_samples=len(samples), daily_vitals=len(vitals_acc),
+               sleep_sessions=len(sleep_rows), workouts=len(workouts),
+               symptoms=len(symptoms), ecg_recordings=len(ecgs),
+               state_of_mind=len(moods))
+    out = dict(out)
+    out["errors"] = len(errors)
+    if errors:
+        out["error_samples"] = errors[:5]
+    if unhandled:
+        out["unhandled"] = unhandled
+    return out
 
 
-def _sleep_row(e: dict):
+def _sample_row(name, units, e: dict):
+    ts = _parse_ts(e.get("date") or e.get("startDate"))
+    if ts is None:
+        raise ValueError("no parseable date")
+    lo, mid, hi = (_num(e.get(k, e.get(k.lower()))) for k in ("Min", "Avg", "Max"))
+    qty = _num(e.get("qty"))
+    if qty is None:
+        qty = mid
+    value = e.get("value")
+    value_text = value if isinstance(value, str) else None
+    if qty is None and value_text is None and not isinstance(value, (int, float)):
+        extra_only = True
+    else:
+        extra_only = False
+    if qty is None and isinstance(value, (int, float)) and not isinstance(value, bool):
+        qty = float(value)
+    extra = {k: v for k, v in e.items() if k not in _SAMPLE_FIELDS}
+    if e.get("endDate"):
+        extra["endDate"] = e["endDate"]
+    if extra_only and not extra:
+        raise ValueError("no value")
+    return (name, ts.isoformat(), ts.date().isoformat(), str(e.get("source") or ""),
+            units, qty, lo, mid, hi, value_text,
+            json.dumps(extra, sort_keys=True) if extra else None)
+
+
+_STAGES = {"deep": "deep", "rem": "rem", "core": "core", "awake": "awake",
+           "asleep": "core", "inbed": "inbed", "in bed": "inbed"}
+
+
+def _sleep_rows(entries: list[dict], errors: list) -> list[tuple]:
+    """Aggregated entries (totalSleep/deep/rem...) map one-to-one. Raw stage
+    segments (value + startDate/endDate) are summed into one session per
+    wake-up date, which is idempotent as long as the whole night is sent."""
+    rows, nights = [], defaultdict(lambda: defaultdict(float))
+    bounds: dict[str, list] = {}
+    for e in entries:
+        try:
+            if any(k in e for k in ("totalSleep", "asleep", "deep", "rem", "core")):
+                r = _sleep_summary(e)
+                if r:
+                    rows.append(r)
+                continue
+            stage = _STAGES.get(str(e.get("value", "")).strip().lower())
+            s, t = _parse_ts(e.get("startDate")), _parse_ts(e.get("endDate"))
+            if not stage or not s or not t:
+                continue
+            key = t.date().isoformat()
+            nights[key][stage] += (t - s).total_seconds() / 60
+            b = bounds.setdefault(key, [s, t])
+            b[0], b[1] = min(b[0], s), max(b[1], t)
+        except Exception as exc:
+            errors.append(f"sleep_analysis: {type(exc).__name__}: {str(exc)[:80]}")
+    for key, st in nights.items():
+        s, t = bounds[key]
+        total = st["deep"] + st["rem"] + st["core"]
+        in_bed = st["inbed"] or (total + st["awake"])
+        eff = round(100 * total / in_bed, 1) if in_bed else None
+        rows.append((s.isoformat(), s.isoformat(), t.isoformat(), round(total, 1),
+                     round(st["deep"], 1), round(st["rem"], 1), round(st["core"], 1),
+                     round(st["awake"], 1), eff))
+    return rows
+
+
+def _sleep_summary(e: dict):
     start = _iso(e.get("sleepStart") or e.get("startDate") or e.get("inBedStart"))
     if not start:
         return None
@@ -231,18 +419,84 @@ def _sleep_row(e: dict):
 
 
 def _workout_row(w: dict):
+    if not isinstance(w, dict):
+        raise ValueError("not an object")
     start = _iso(w.get("start"))
     wtype = w.get("name") or w.get("workout_type") or "Unknown"
     if not start:
-        return None
-    wid = w.get("id") or hashlib.sha1(f"{wtype}|{start}".encode()).hexdigest()[:16]
+        raise ValueError("no start")
+    wid = w.get("id") or _hid(wtype, start)
     duration_s = _num(w.get("duration"))
     if duration_s is None:
         end = _parse_ts(w.get("end"))
         duration_s = (end - _parse_ts(w.get("start"))).total_seconds() if end else None
+    hr = w.get("heartRate") if isinstance(w.get("heartRate"), dict) else {}
     energy = _num(w.get("activeEnergyBurned") or w.get("activeEnergy"))
-    avg_hr = _num(w.get("avgHeartRate") or (w.get("heartRate") or {}).get("avg"))
-    max_hr = _num(w.get("maxHeartRate") or (w.get("heartRate") or {}).get("max"))
-    return (str(wid), wtype, start,
+    avg_hr = _num(w.get("avgHeartRate") or hr.get("avg"))
+    max_hr = _num(w.get("maxHeartRate") or hr.get("max"))
+    return (str(wid), str(wtype), start,
             round(duration_s / 60, 1) if duration_s is not None else None,
             energy, avg_hr, max_hr)
+
+
+def _symptom_row(s: dict):
+    if not isinstance(s, dict):
+        raise ValueError("not an object")
+    start = _iso(s.get("start") or s.get("date"))
+    name = s.get("name")
+    if not start or not name:
+        raise ValueError("symptom needs name and start")
+    sev = s.get("severity")
+    return (_hid(name, start), str(name), start, _iso(s.get("end")),
+            None if sev is None else str(sev), s.get("source"))
+
+
+def _ecg_row(e: dict):
+    if not isinstance(e, dict):
+        raise ValueError("not an object")
+    start = _iso(e.get("start"))
+    if not start:
+        raise ValueError("no start")
+    volts = e.get("voltageMeasurements") or []
+    series = [_num(v.get("voltage") if isinstance(v, dict) else v) for v in volts]
+    blob = zlib.compress(json.dumps(series).encode(), 6) if series else None
+    return (start, start, _iso(e.get("end")), e.get("classification"),
+            e.get("severity"), _num(e.get("averageHeartRate")),
+            _num(e.get("samplingFrequency")),
+            int(_num(e.get("numberOfVoltageMeasurements")) or len(series)),
+            e.get("source"), blob)
+
+
+def _mood_row(m: dict):
+    if not isinstance(m, dict):
+        raise ValueError("not an object")
+    start = _iso(m.get("start") or m.get("date"))
+    if not start:
+        raise ValueError("no start")
+    return (str(m.get("id") or _hid(start, m.get("kind"))), start, _iso(m.get("end")),
+            m.get("kind"), _num(m.get("valence")), m.get("valenceClassification"),
+            json.dumps(m.get("labels") or []), json.dumps(m.get("associations") or []))
+
+
+def reprocess(conn: sqlite3.Connection) -> dict:
+    """Re-ingest every stored raw payload with the current parser."""
+    total = defaultdict(int)
+    for (blob,) in conn.execute("SELECT body_zlib FROM raw_payloads ORDER BY received_at").fetchall():
+        try:
+            result = ingest(json.loads(zlib.decompress(blob)), conn)
+        except ValueError:
+            total["rejected"] += 1
+            continue
+        for k, v in result.items():
+            if isinstance(v, int):
+                total[k] += v
+    return dict(total)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--reprocess"]:
+        c = connect()
+        print(json.dumps(reprocess(c), indent=2))
+        c.close()
+    else:
+        sys.exit("usage: python3 -m core.health --reprocess")
