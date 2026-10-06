@@ -81,3 +81,35 @@ Claims in fixed answer text, checked against the page each one cites. Verdicts: 
 | quant | "real trading would do worse" | unsupported as a guarantee | reworded as a simulation limitation |
 
 Researched answers (`surfaces/research.py`) quote MedlinePlus sentences word for word, so they cannot misstate their source. Their remaining risks are **relevance** (handled by the title/all-keyword gate) and **applicability**, which the answer labels.
+
+## Round 2 (2026-10-06): conversation depth
+
+### What is actually implemented
+
+| Layer | Implemented? | Detail |
+|---|---|---|
+| Deterministic facts | yes | Health, property and Quant numbers come only from `core/*_facts.py`. |
+| Live source retrieval | yes | Health questions query NIH MedlinePlus (consumer pages) and PubMed (systematic reviews and meta-analyses in humans since 2010, main keyword in the title). Property follow-ups query NYC Open Data ACRIS: parties (636b-3b5g), legals (8h5j-fqxa), master (bnx9-e6tj). |
+| Synthesis | extractive only | Candidate sentences are scored by fixed rules: keyword overlap, the aspect asked about, findings over aims, Results/Conclusions sections. They are de-duplicated and quoted with [n]. The rules also detect uncertainty statements, aspect gaps ("no source addresses timing") and study populations. |
+| Broader web search | **no** | No search API is configured. |
+| Model reasoning | **no** | No model in the answer path; see the decisions below. |
+| Follow-ups | yes | Short messages continue the last card for 30 minutes (context stored in assist.db). Each card type has its own follow-up words. Generic phrasing with a new subject starts a new question; a message about another domain switches domain. After a batch of cards, the bot picks the card that fits the question or asks which one. |
+
+What leaves the box: up to 3 topic keywords per health lookup, and document/lot numbers for property lookups. Nothing goes to Hermes or Gemini. NCBI requests are paced at 0.4 s apart (its limit without an API key is 3/s), with one retry on 429.
+
+### Known limits
+* Choosing keywords is rule-based. When nothing matches, the search broadens by dropping generic words, then at most one specific word. It can drop the word that mattered ("train boxing sick" → "boxing"), but the answer says it broadened. A model would choose better.
+* Quotes are verbatim, but deciding which ones answer the question is heuristic. Population tags come from titles and "in/among …" phrases only.
+* The NIH Office of Dietary Supplements API is behind a Cloudflare challenge, so it isn't used.
+
+### Fixed in this round
+* Workout durations are computed (reps × 4 s, rests, side switches, 30 s transitions, warm-up). The old "15-minute" plan was about 21 minutes; it is now about 16 and labelled with its computed total.
+* `/profile`: items from `var/health_profile.md` start as *unconfirmed*. Workouts use confirmed items only, cues match the plan, and re-seeding never brings back an item you removed.
+* Sources buttons link to the exact pages; research answers get one button per cited source.
+* Every card and the brief show the same "🕒 … as of" times in ET. Quant UTC labels were removed.
+* `core/health.py`: unsummarized sleep-stage segments crossing midnight were split into two nights. They are now clustered into one session. **This takes effect when spine-health is restarted (pending approval).**
+* ACRIS document names and party roles come from the official 126-code table (`core/acris_codes.json`). The old hard-coded guess "MCON = consolidation" was wrong: it is a memorandum of contract.
+* Health Auto Export: the receiver was contract-tested against the app's documented sleep (summarized and stage) and v2 workout JSON. The Sync help text now uses the app's own option names.
+
+### Resources
+The service RSS is about 14–25 MB, under its 128 MB cap. An uncached research answer takes 0.6–2 s and makes 2–8 public HTTP requests; cached answers are local. No model RAM is used and there is no cost.

@@ -33,6 +33,7 @@ time, once per local day (brief_log), skipped during pause.
 from __future__ import annotations
 
 import argparse
+import re
 import os
 import sys
 import time
@@ -40,7 +41,7 @@ import traceback
 from datetime import datetime, timezone
 
 from core import health_facts as hf, property_facts as pf
-from surfaces import assistant as A, daily, router
+from surfaces import assistant as A, daily, profile as P, research as R, router
 from surfaces.assistant import Reply
 from surfaces.store import Store
 from surfaces.tg import Bot, TgError, esc, kb
@@ -51,7 +52,7 @@ COMMANDS = [("brief", "Today's short overview"), ("health", "Your health data an
             ("focus", "What goes in your brief"), ("settings", "Brief time, quiet hours"),
             ("glossary", "Plain-English terms"), ("sources", "Where answers come from"),
             ("status", "Operator view"), ("privacy", "What is stored and where"),
-            ("help", "What this bot does"), ("cancel", "Cancel a pending choice")]
+            ("profile", "Your confirmed profile"), ("help", "What this bot does"), ("cancel", "Cancel a pending choice")]
 
 
 def log(event, **kw):
@@ -78,7 +79,8 @@ class Assistant:
             btns = [(label, self.store.token(card_id, act, arg)) for label, act, arg in r.actions]
             rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
         if r.links:
-            rows.append([(label[:40], url) for label, url in r.links[:3]])
+            links = [(label[:40], url) for label, url in r.links[:6]]
+            rows += [links[i:i + 2] for i in range(0, len(links), 2)]
         markup = kb(rows) if rows else None
         if r.photo:
             msg = self.bot.photo(chat_id, r.photo, r.text, markup, silent=silent)
@@ -86,7 +88,33 @@ class Assistant:
             msg = self.bot.send(chat_id, r.text, markup, reply_to=reply_to, silent=silent)
         if card_id and msg:
             self.store.attach_msg(card_id, msg["message_id"])
+            if r.domain not in ("brief", "status", "general", "focus"):
+                self.store.set_pref("context", {"card": card_id, "ts": time.time()})
         return msg
+
+    CONTEXT_TTL_S = 30 * 60
+
+    def context_card(self, text=""):
+        """The card a short follow-up refers to. After a batch (three property
+        cards at once) pick the one the question fits; if none fits, None."""
+        c = self.store.pref("context")
+        if not c or time.time() - c.get("ts", 0) > self.CONTEXT_TTL_S:
+            return None
+        if c.get("batch"):
+            cards = [self.store.card(cid) for cid in c["batch"]]
+            cards = [x for x in cards if x]
+            t = text.lower()
+            want = ("MTGE",) if re.search(r"borrow|lend|loan|mortgage|bank", t) else \
+                ("DEED", "DEEDO") if re.search(r"sold|sale|buyer|seller|bought|grant", t) else None
+            if want:
+                fit = [x for x in cards if (x["snapshot"] or {}).get("doc_type") in want]
+                if len(fit) == 1:
+                    return fit[0]
+            return {"ambiguous": cards}
+        return self.store.card(c["card"])
+
+    def confirmed_profile(self):
+        return P.confirmed(self.store.conn)
 
     # ── authorization ──────────────────────────────────────────────
     def authorized(self, user, chat) -> bool:
@@ -168,9 +196,9 @@ class Assistant:
             return self.emit(chat, A.health_summary(now=self.now()))
         if cmd == "workout":
             plan = "mobility10" if "mob" in arg else "walkprep8" if "walk" in arg else "strength15"
-            return self.emit(chat, A.workout(plan, A.load_profile()))
+            return self.emit(chat, A.workout(plan, self.confirmed_profile()))
         if cmd == "mobility":
-            return self.emit(chat, A.mobility(A.load_profile()))
+            return self.emit(chat, A.mobility(self.confirmed_profile()))
         if cmd == "property":
             return self.send_property(chat)
         if cmd == "quant":
@@ -193,12 +221,37 @@ class Assistant:
                                          actions=[("Forget everything", "forget", "all"),
                                                   ("Only history", "forget", "history"),
                                                   ("Cancel", "noop", "")]))
+        if cmd == "profile":
+            if arg.lower().startswith("add "):
+                P.add_note(s.conn, arg[4:])
+                return self.bot.send(chat, "Added to your profile as a confirmed note. Notes are shown "
+                                           "back to you; only the listed items change workouts.")
+            return self.show_profile(chat)
         if cmd == "cancel":
             s.set_pref("pending", None)
             return self.bot.send(chat, "Cancelled. Nothing is pending.")
         return self.bot.send(chat, "Unknown command. /help lists what I can do.")
 
     def on_text(self, chat, text):
+        card = self.context_card(text)
+        if card and "ambiguous" in card and any(router.card_hook(text, x) for x in card["ambiguous"]):
+            return self.bot.send(chat, "Which record do you mean? Reply to that card with your "
+                                       "question (swipe left on it in Telegram).")
+        if card and "ambiguous" not in card and not router.switches_domain(text, card["domain"]) \
+                and router.should_follow(text, card):
+            self.store.tel("followup", detail=card["domain"])
+            return self.on_card_followup(chat, card, text, None)
+        return self._route(chat, text)
+
+    def _route(self, chat, text):
+        item = A.find_property(text)
+        if item:
+            return self.emit(chat, A.property_card(item, now=self.now()))
+        m = re.search(r"\bwhat(?:'s| is) an? ([a-z&' ]{3,40}?)\??$", text.lower())
+        if m:
+            code = A.acris_code_reply(m.group(1).strip())
+            if code:
+                return self.emit(chat, code)
         intent = router.route(text)
         if router.novel(text, intent):
             intent = "unknown"
@@ -206,9 +259,9 @@ class Assistant:
         if intent == "sexual":
             return self.emit(chat, A.sexual_health())
         if intent == "mobility":
-            return self.emit(chat, A.mobility(A.load_profile()))
+            return self.emit(chat, A.mobility(self.confirmed_profile()))
         if intent == "workout":
-            return self.emit(chat, A.workout("strength15", A.load_profile()))
+            return self.emit(chat, A.workout("strength15", self.confirmed_profile()))
         if intent == "sleep":
             return self.emit(chat, A.sleep_answer(now=self.now()))
         if intent == "improve":
@@ -228,7 +281,10 @@ class Assistant:
             if t and len(text) < 40:
                 return self.emit(chat, A.glossary_reply(t))
             return self.send_property(chat)
-        if intent == "quant":
+        if intent == "quant" or re.search(r"\b(bot|simulation|quant)\b.*\b(buy|bought|own|hold)", text.lower()):
+            pos = A.find_position(text)
+            if pos:
+                return self.emit(chat, A.quant_why(int(pos["id"])))
             return self.emit(chat, A.quant_summary(now=self.now()))
         if intent == "focus":
             topic = router.focus_topic(text)
@@ -254,8 +310,11 @@ class Assistant:
             return self.bot.send(chat, "No recent large recorded documents in the store.")
         self.bot.send(chat, "<b>Recorded property documents</b> (largest first). Reply “Explain "
                             "this” to any card. These are filings, not listings or advice.")
+        ids = []
         for it in items:
             self.emit(chat, A.property_card(it, conn, now=self.now()), silent=True)
+            ids.append(self.store.pref("context")["card"])
+        self.store.set_pref("context", {"batch": ids, "ts": time.time()})
 
     def propose_focus(self, chat, topic):
         label, sensitive = daily.FOCUS_TOPICS.get(topic, (topic, False))
@@ -350,6 +409,15 @@ class Assistant:
                          "incl. headroom; answers here don't use it).")
         except Exception:
             pass
+        try:
+            hc = A.health_conn()
+            n_sleep = hc.execute("SELECT COUNT(*) FROM sleep_sessions").fetchone()[0]
+            n_work = hc.execute("SELECT COUNT(*) FROM workouts").fetchone()[0]
+            lines.append(f"Health records: {n_sleep} sleep sessions, {n_work} workouts.")
+        except Exception:
+            pass
+        lines.append("Answers: deterministic + live public-source retrieval; no model in the answer path "
+                     f"(online research {'on' if self.store.pref('research_online') else 'off'}).")
         r = self.store.conn.execute(
             "SELECT event, COUNT(*), SUM(1-ok), CAST(AVG(ms) AS INT) FROM telemetry WHERE ts > ? "
             "GROUP BY event", (time.time() - 86400,)).fetchall()
@@ -367,34 +435,118 @@ class Assistant:
             pass
         return Reply("\n".join(lines), domain="status")
 
-    # ── replies to a card ──────────────────────────────────────────
+    # ── replies to a card, or short follow-ups to the last card ───
     def on_card_followup(self, chat, card, text, msg_id):
-        intent = router.followup(text)
         ref, snap = card["ref"], card["snapshot"] or {}
-        kind = ref.get("kind")
+        kind, dom = ref.get("kind"), card["domain"]
+        t = text.lower()
+
+        def has(pat):
+            return re.search(pat, t) is not None
+
+        if kind == "research" or dom == "research":
+            old = ref.get("keywords") or []
+            new = [k for k in R.keywords(text, limit=4) if k not in old and k not in router.COVERED]
+            kws = (old[:2] + new[:1]) if new else old
+            asp = R.aspect(text)
+            if not new and (asp is None or asp == ref.get("aspect")):
+                return self.bot.send(chat, "The sources I retrieved have nothing more on that angle "
+                                           "than the answer above. Try a different angle (how much, "
+                                           "timing, safety), or a clinician for a personal answer.")
+            return self.emit(chat, A.research_answer(
+                text, self.store.conn, online=self.store.pref("research_online"), now=self.now(),
+                opener=self.research_opener, kws=kws, asp=asp, context=" ".join(old)),
+                reply_to=msg_id)
         if kind == "acris_item":
-            act = {"p_saleloan": "p_saleloan", "p_score": "p_score", "p_building": "p_building"}.get(
-                intent, "p_explain")
-            if intent == "next":
+            for pat, act in ((r"lender|borrow|bank|buyer|seller|who|owner|part(y|ies)|grantor|grantee", "p_parties"),
+                             (r"history|before|else|previous|past|other (record|document)|earlier", "p_history"),
+                             (r"sale|loan|sold|refinanc", "p_saleloan"),
+                             (r"score|ranking|why .*(send|sent|flag|select|pick)", "p_score"),
+                             (r"building|units|built|zoning|how big|floors", "p_building"),
+                             (r"worth|value|price|valuation", "p_value")):
+                if has(pat):
+                    return self.card_action(chat, card, act, None, reply_to=msg_id)
+            if has(r"what should i do|next step|what now"):
                 return self.emit(chat, Reply(
                     "Next steps for learning (not investing advice): open the official ACRIS "
-                    "record to see the parties and pages; open the lot on ZoLa to see the "
-                    "building and zoning; tap Save to keep it on your watchlist.",
-                    domain="property"), reply_to=msg_id)
-            return self.card_action(chat, card, act, None, reply_to=msg_id)
+                    "record to see the pages; tap “Lot history” to see what else was filed; "
+                    "tap Save to keep it on your watchlist.", domain="property"), reply_to=msg_id)
+            return self.card_action(chat, card, "p_explain", None, reply_to=msg_id)
         if kind == "position":
+            if has(r"rule|track|perform|win|record|how (has|did|does) (it|this)"):
+                return self.emit(chat, A.quant_rule(snap.get("rule") or ""), reply_to=msg_id)
             return self.emit(chat, A.quant_why(int(ref["position_id"])), reply_to=msg_id)
-        if card["domain"] == "quant":
+        if dom == "quant":
+            pos = A.find_position(text)
+            if pos:
+                if has(r"rule|track|perform|win|record"):
+                    return self.emit(chat, A.quant_rule(pos["rule"]), reply_to=msg_id)
+                return self.emit(chat, A.quant_why(int(pos["id"])), reply_to=msg_id)
+            if has(r"change|today|24|new|opened|closed"):
+                return self.emit(chat, A.quant_changes(now=self.now()), reply_to=msg_id)
+            if has(r"risk|assum|real money|fees|slippage"):
+                return self.emit(chat, Reply(A.QUANT_RISKS, domain="quant"), reply_to=msg_id)
+            if has(r"position|holding|what (do|does) it (own|hold)"):
+                return self.card_action(chat, card, "q_positions", None)
             return self.emit(chat, A.quant_calc(snap), reply_to=msg_id)
-        if card["domain"] == "health":
-            if intent == "next":
+        if kind == "workout":
+            plan = ref.get("plan", "strength15")
+            if has(r"hurt|pain|sore|injur|swell|numb|tingl"):
+                return self.emit(chat, Reply(
+                    "If a move causes sharp pain, swelling, numbness or tingling, stop that move. "
+                    "Pain that lingers into the next day, or any swelling, is worth a campus-health or "
+                    "physio check before continuing. Mild muscle effort and soreness a day later are "
+                    "normal. For today, the mobility plan is a gentler option: /mobility",
+                    domain="health"), reply_to=msg_id)
+            if has(r"short|quick|less time|no time|busy"):
+                return self.emit(chat, Reply(A.workouts.shorter(plan), domain="health"), reply_to=msg_id)
+            if has(r"easier|too hard|hard|tough|beginner"):
+                return self.emit(chat, Reply(
+                    "Easier: use each move's “Easier” option and do 1 set instead of 2. Keep the "
+                    "slow tempo; that matters more than the number of reps.", domain="health"),
+                    reply_to=msg_id)
+            if has(r"harder|too easy|easy|progress|more"):
+                return self.emit(chat, Reply(
+                    "Progress one thing at a time, only after a session felt easy: add 2 reps to each "
+                    "set, or a third set, or slow the lowering to 3 s. Not all at once.",
+                    domain="health"), reply_to=msg_id)
+        if dom == "health":
+            if has(r"trend|chart|last week|this week|30|month|over time"):
+                m, d = router.trend_metric(text)
+                return self.emit(chat, A.trend(m, d, now=self.now()))
+            if has(r"what should i do|next|improve"):
                 return self.emit(chat, A.improve(now=self.now()), reply_to=msg_id)
+            if router.novel(text, "health"):
+                return self.emit(chat, A.research_answer(
+                    text, self.store.conn, online=self.store.pref("research_online"), now=self.now(),
+                    opener=self.research_opener), reply_to=msg_id)
             return self.emit(chat, A.explain_health(now=self.now()), reply_to=msg_id)
-        if card["domain"] == "brief":
+        if dom == "brief":
             return self.emit(chat, Reply("This brief lists at most three things from your data. "
                                          "Tap a domain button to see the details and the dates "
                                          "behind each line."), reply_to=msg_id)
-        return self.on_text(chat, text)
+        return self._route(chat, text)
+
+    # ── profile ────────────────────────────────────────────────────
+    def show_profile(self, chat):
+        conn = self.store.conn
+        P.seed_from_file(conn, A.load_profile())
+        items = P.items(conn)
+        lines = ["<b>Your profile</b> (self-reported; used only after you confirm)"]
+        acts = []
+        for it in items:
+            mark = {"confirmed": "✅", "unconfirmed": "❔"}.get(it["status"], "")
+            lines.append(f"{mark} {esc(it['label'])} — {it['status']}, from {esc(it['origin'])}")
+            if not it["key"].startswith("note:"):
+                if it["status"] != "confirmed":
+                    acts.append((f"Confirm: {it['label']}"[:32], "pf_confirm", it["key"]))
+                acts.append((f"Remove: {it['label']}"[:32], "pf_remove", it["key"]))
+        if not items:
+            lines.append("Nothing saved.")
+        lines.append("\n❔ items are suggestions read from your old profile file; workouts ignore them "
+                     "until you confirm. Add your own: <code>/profile add sprained left ankle in 2025</code>")
+        return self.emit(chat, Reply("\n".join(lines), domain="profile", ref={"kind": "profile"},
+                                     actions=acts[:10]))
 
     # ── callbacks ──────────────────────────────────────────────────
     def on_callback(self, cq):
@@ -408,7 +560,7 @@ class Assistant:
             return
         action, arg = cb["action"], cb["arg"]
         side_effect = action in ("fb", "focus_add", "focus_pause", "focus_resume", "focus_cancel",
-                                 "forget", "p_save", "p_dismiss")
+                                 "forget", "p_save", "p_dismiss", "pf_confirm", "pf_remove")
         if side_effect:
             if status == "used" or not self.store.mark_used(cb["token"]):
                 return self.bot.answer(cq["id"], "Already recorded.")
@@ -432,9 +584,10 @@ class Assistant:
             return self.emit(chat, A.sync_help())
         if action == "sources":
             ids = A.evidence.TOPICS.get(arg, [])
-            return self.emit(chat, Reply("<b>Sources</b>\n" + A.sources_text(ids)))
+            return self.emit(chat, Reply("<b>Sources for that answer</b>\n" + A.sources_text(ids),
+                                         links=A.source_links(ids)))
         if action == "workout":
-            return self.emit(chat, A.workout(arg or "strength15", A.load_profile()))
+            return self.emit(chat, A.workout(arg or "strength15", self.confirmed_profile()))
         if action == "fb":
             s.feedback(card["id"], arg)
             replies = {"done": "Logged as done (your report, not sensor data). Nice.",
@@ -485,6 +638,33 @@ class Assistant:
                 s.set_pref(key, lst)
             return self.bot.send(chat, "Saved to your local watchlist." if action == "p_save"
                                  else "Dismissed locally. The source record is unchanged.")
+        if action == "p_parties":
+            return self.emit(chat, A.property_parties(snap), reply_to=reply_to)
+        if action == "p_history":
+            return self.emit(chat, A.property_history(snap), reply_to=reply_to)
+        if action == "p_value":
+            return self.emit(chat, Reply(
+                "Value: a mortgage amount is a loan, and a deed amount is a past price. Assessed value "
+                "on the Building facts card is a tax figure, usually far below market value. Our "
+                "valuation model isn't shown yet: its backtested error is still above the 25% bar, so "
+                "I won't give you a number.", domain="property"), reply_to=reply_to)
+        if action == "r_aspect":
+            old = (card["ref"] or {}).get("keywords") or []
+            return self.emit(chat, A.research_answer(
+                " ".join(old), s.conn, online=s.pref("research_online"), now=self.now(),
+                opener=self.research_opener, kws=old, asp=arg, context=" ".join(old)))
+        if action == "w_short":
+            return self.emit(chat, Reply(A.workouts.shorter(arg or "strength15"), domain="health"))
+        if action == "profile":
+            return self.show_profile(chat)
+        if action in ("pf_confirm", "pf_remove"):
+            st = "confirmed" if action == "pf_confirm" else "removed"
+            P.set_status(s.conn, arg, st)
+            return self.bot.send(chat, f"Profile item {st}. /profile to review.")
+        if action == "q_changes":
+            return self.emit(chat, A.quant_changes(now=self.now()))
+        if action == "q_rule":
+            return self.emit(chat, A.quant_rule(arg))
         if action == "q_positions":
             for r in A.quant_positions():
                 self.emit(chat, r, silent=True)
