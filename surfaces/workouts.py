@@ -6,15 +6,24 @@ Durations are COMPUTED, never stated: work time (reps x tempo, or holds,
 both sides when per-side) + rests between sets + side switches + a
 transition between moves + the warm-up. The plan title shows the computed
 total, so "15 minutes" cannot quietly mean 21.
+
+Budgets are ENFORCED, not just reported: every plan is fitted to a time
+limit (the plan's nominal minutes, or the minutes the user asked for).
+fit() trims in a fixed order until the computed total is within the limit:
+drop sets (last move first, never below 1), shorten the warm-up to
+MIN_WARM_S, then drop trailing moves. Nothing is ever padded to fill time.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 TEMPO_S = 4          # seconds per controlled rep (about 2 s down, 1 s pause, 1 s up)
 SWITCH_S = 10        # changing sides within a set
 TRANSITION_S = 30    # getting into position for the next move
+MIN_WARM_S = 60      # the warm-up is shortened to this, never removed
+MIN_BUDGET_MIN, MAX_BUDGET_MIN = 3, 90
 
 
 @dataclass(frozen=True)
@@ -32,14 +41,16 @@ class Move:
         one = (self.reps or 0) * TEMPO_S + (self.hold_s or 0)
         return one * (2 if self.per_side else 1) + (SWITCH_S if self.per_side else 0)
 
-    def seconds(self) -> int:
-        return self.sets * self.work_s() + (self.sets - 1) * self.rest_s
+    def seconds(self, sets: int | None = None) -> int:
+        n = self.sets if sets is None else sets
+        return n * self.work_s() + (n - 1) * self.rest_s
 
-    def dose(self) -> str:
+    def dose(self, sets: int | None = None) -> str:
+        n = self.sets if sets is None else sets
         unit = f"{self.reps} reps" if self.reps else f"{self.hold_s} s hold"
         side = " per side" if self.per_side else ""
-        rest = f", rest {self.rest_s} s between sets" if self.sets > 1 and self.rest_s else ""
-        return f"{self.sets} × {unit}{side}{rest}"
+        rest = f", rest {self.rest_s} s between sets" if n > 1 and self.rest_s else ""
+        return f"{n} × {unit}{side}{rest}"
 
 
 MOVES = {
@@ -84,7 +95,7 @@ MOVES = {
                             "mild stretch.", "Keep the knee bent more."),
 }
 
-# plan id -> (name, warm-up seconds, warm-up text, moves)
+# plan id -> (name, warm-up seconds, warm-up text, moves); BUDGET_MIN is the default limit
 PLANS = {
     "strength15": ("Quiet strength (mat)", 120,
                    "Warm-up 2 min: march in place softly, then cat-cow on hands and knees.",
@@ -97,13 +108,48 @@ PLANS = {
                   ["ankle_circles", "calf_raise", "glute_bridge", "single_leg_balance"]),
 }
 
+BUDGET_MIN = {"strength15": 15, "mobility10": 10, "walkprep8": 8}
+
 SAFETY = ("Stop and get checked if something causes sharp pain, swelling, numbness or tingling, "
           "or pain that lingers into the next day. Mild muscle effort is fine.")
 
 
-def plan_seconds(plan_id: str) -> int:
+def minutes_in(text: str) -> int | None:
+    """'15 min', '15-minute', 'only have 8 minutes' -> minutes, clamped to a sane range."""
+    m = re.search(r"\b(\d{1,3})\s*-?\s*(?:min|mins|minutes?)\b", text or "", re.I)
+    if not m:
+        return None
+    return max(MIN_BUDGET_MIN, min(MAX_BUDGET_MIN, int(m.group(1))))
+
+
+def _total(warm: int, chosen: list[tuple[str, int]]) -> int:
+    return (warm + sum(MOVES[m].seconds(n) for m, n in chosen)
+            + TRANSITION_S * max(len(chosen) - 1, 0))
+
+
+def fit(plan_id: str, minutes: int | None = None) -> tuple[int, list[tuple[str, int]], int]:
+    """(warm-up s, [(move, sets)], limit s) whose computed total is <= the limit.
+    If even one set of the first move does not fit, that single set is returned
+    and the caller reports that the limit is too short."""
     _, warm, _, moves = PLANS[plan_id]
-    return warm + sum(MOVES[m].seconds() for m in moves) + TRANSITION_S * (len(moves) - 1)
+    limit = 60 * (minutes or BUDGET_MIN[plan_id])
+    chosen = [[m, MOVES[m].sets] for m in moves]
+    while _total(warm, chosen) > limit:
+        multi = [c for c in chosen if c[1] > 1]
+        if multi:
+            multi[-1][1] -= 1
+        elif warm > MIN_WARM_S:
+            warm = MIN_WARM_S
+        elif len(chosen) > 1:
+            chosen.pop()
+        else:
+            break
+    return warm, [(m, n) for m, n in chosen], limit
+
+
+def plan_seconds(plan_id: str, minutes: int | None = None) -> int:
+    warm, chosen, _ = fit(plan_id, minutes)
+    return _total(warm, chosen)
 
 
 def _mmss(s):
@@ -111,16 +157,31 @@ def _mmss(s):
     return f"{m}:{s:02d}"
 
 
-def render(plan_id: str, profile_notes: list[str] | None = None) -> str:
-    name, warm, intro, moves = PLANS[plan_id]
-    total = plan_seconds(plan_id)
-    lines = [f"<b>{name}</b> — about {round(total / 60)} min total (mat only, no jumping)",
-             f"<i>Includes rests and {TRANSITION_S} s transitions; reps at ~{TEMPO_S} s each.</i>",
+def _header(name: str, total: int, limit: int, trimmed: bool) -> str:
+    if total > limit:
+        return (f"<b>{name}</b> — {_mmss(total)} total; the shortest useful version is longer "
+                f"than your {limit // 60} min, so this is one move only")
+    note = ", trimmed to fit" if trimmed else ""
+    return f"<b>{name}</b> — {_mmss(total)} total, within {limit // 60} min{note} (mat only, no jumping)"
+
+
+def render(plan_id: str, profile_notes: list[str] | None = None, minutes: int | None = None) -> str:
+    name, warm0, intro, moves = PLANS[plan_id]
+    warm, chosen, limit = fit(plan_id, minutes)
+    total = _total(warm, chosen)
+    trimmed = warm != warm0 or [(m, MOVES[m].sets) for m in moves] != chosen
+    if warm != warm0:
+        intro = f"Warm-up {warm // 60} min: " + intro.split(": ", 1)[-1]
+    lines = [_header(name, total, limit, trimmed),
+             f"<i>Includes warm-up, rests and {TRANSITION_S} s transitions; reps at ~{TEMPO_S} s each.</i>",
              intro, ""]
-    for i, m in enumerate(moves, 1):
+    for i, (m, n) in enumerate(chosen, 1):
         mv = MOVES[m]
-        lines.append(f"{i}. <b>{mv.name}</b> — {mv.dose()} (≈{_mmss(mv.seconds())})\n"
+        lines.append(f"{i}. <b>{mv.name}</b> — {mv.dose(n)} (≈{_mmss(mv.seconds(n))})\n"
                      f"   {mv.how}\n   Easier: {mv.easier}")
+    dropped = [MOVES[m].name for m in moves[len(chosen):]]
+    if dropped:
+        lines.append(f"<i>Left out to fit the time: {', '.join(dropped)}.</i>")
     if profile_notes:
         lines.append("")
         lines += profile_notes
@@ -129,13 +190,22 @@ def render(plan_id: str, profile_notes: list[str] | None = None) -> str:
     return "\n".join(lines)
 
 
-def shorter(plan_id: str) -> str:
-    """A 1-set version of the same plan for busy days."""
+def shorter(plan_id: str, minutes: int | None = None) -> str:
+    """A 1-set version of the same plan for busy days, still within the limit."""
     name, warm, intro, moves = PLANS[plan_id]
-    secs = warm + sum(MOVES[m].work_s() for m in moves) + TRANSITION_S * (len(moves) - 1)
-    lines = [f"<b>{name} — short version</b>, about {round(secs / 60)} min: one set of each move, "
-             "no rests between sets.", intro]
-    for m in moves:
+    limit = 60 * (minutes or BUDGET_MIN[plan_id])
+    chosen = [(m, 1) for m in moves]
+    while _total(warm, chosen) > limit and len(chosen) > 1:
+        if warm > MIN_WARM_S:
+            warm = MIN_WARM_S
+        else:
+            chosen.pop()
+    secs = _total(warm, chosen)
+    if warm != PLANS[plan_id][1]:
+        intro = f"Warm-up {warm // 60} min: " + intro.split(": ", 1)[-1]
+    lines = [f"<b>{name} — short version</b>, {_mmss(secs)} total including warm-up and "
+             f"transitions: one set of each move, no rests between sets.", intro]
+    for m, _ in chosen:
         mv = MOVES[m]
         unit = f"{mv.reps} reps" if mv.reps else f"{mv.hold_s} s"
         lines.append(f"• {mv.name}: 1 × {unit}{' per side' if mv.per_side else ''}")

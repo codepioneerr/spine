@@ -113,3 +113,22 @@ What leaves the box: up to 3 topic keywords per health lookup, and document/lot 
 
 ### Resources
 The service RSS is about 14–25 MB, under its 128 MB cap. An uncached research answer takes 0.6–2 s and makes 2–8 public HTTP requests; cached answers are local. No model RAM is used and there is no cost.
+
+## Round 3 (2026-10-06 evening): verification and budgets
+
+Branch `feat/assistant-round3` from `62f7821`. **Not merged.** `spine-assist` runs from the main checkout, so this takes effect only after a merge and a `spine-assist` restart, which both need Nick's approval.
+
+### Verified state (23:00 UTC)
+* **Typed "Explain this" reply: it has not arrived.** The last stored update is 17:34 UTC. `spine-assist` was restarted at 18:14 UTC when 62f7821 was deployed. Its log has no errors, and it holds an open long-poll connection to Telegram. Message bodies are not stored, so the reply's latency cannot be measured. Latency measured from telemetry for the earlier session: text answers took 0.48–0.65 s, the `p_explain` button took 5.5–7.0 s (live ACRIS lookups), and other buttons took 1.0–1.4 s.
+* **`spine-health` was restarted at 23:01:59 UTC** (approved). Before the restart: the last sync was at 22:41, there were no open :8123 connections and no import process was running. After the restart it listens on loopback and the Tailscale address and returns 401 without the token. The cross-midnight sleep fix is now live. New regression test: `tests/test_health.py::test_stage_segments_crossing_midnight_are_one_night`. It passes on the fix and fails on the pre-fix `core/health.py`.
+* The scheduled brief is still off (no `brief` enable preference is set). The Hermes-delivered `brief` cron (09:40 UTC) is unchanged.
+
+### Workout time budgets (enforced)
+Before this round, the computed totals overran their labels: strength15 took 16:00, mobility10 about 15:00 and walkprep8 10:42. `surfaces/workouts.fit()` now trims a plan until its computed total, including the warm-up, rests, side switches and transitions, is within the limit. The limit is the plan's nominal minutes, or the minutes the user asks for ("15-minute workout", "I only have 8 minutes", `/workout 20 min`). Trimming happens in this order: drop sets (last move first, never below 1), shorten the warm-up to 60 s, then drop trailing moves, which are named in the plan. Plans are never padded. Results: strength15 takes 14:39, mobility10 8:42 and walkprep8 7:44. The "Shorter version" option honours the same limit. Tests: `TestWorkouts` in `tests/test_conversation.py`. The full suite has 391 tests and all pass.
+
+### Local model for source-grounded answers: assessment, no benchmark run
+* The only model is qwen3.5:4b Q4_K_M (3.4 GB on disk, about 3.6 GB resident) on the shared `personal-os-ollama` instance (Codex's unit, one model loaded at a time). That unit is currently stopped. Its API answers, but nothing is loaded.
+* RAM: 7.8 GB total, 3.7 GB available at 19:00 ET, and 586 MB of swap already in use. The gate is 3500 + 1024 MB headroom. Brief logs show 5.1–6.9 GB available at 05:40 ET on 4 of the last 6 days, and 1.0 and 2.4 GB on the other two.
+* Latency, from real runs: about 500 tokens in and about 75 out took 33–36 s, including load. A grounded answer needs roughly 1.5–3k tokens of quoted sources, and on this CPU it is estimated at 1–2 minutes. This is an estimate, not a measurement.
+* Concurrency: 1. CLAUDE.md forbids concurrent model loops and daytime heavy jobs.
+* **Conclusion:** on-demand daytime answers are not practical: a 3.6 GB model would exceed the ~2 GB daytime budget and would be too slow for chat. An overnight batch that answers saved research questions (01:00–06:00, gated by the existing RAM check) is practical about 2 nights in 3. Answer quality is **unmeasured**. The benchmark was not run: RAM was below the gate and it was outside the night window. Next step if approved: a one-off night benchmark (about 5 saved questions, one at a time, with timing and a faithfulness check against the quoted sources) before any scheduled job is added.

@@ -144,15 +144,41 @@ class TestRoundThree(unittest.TestCase):
 
 class TestWorkouts(unittest.TestCase):
     def test_durations_include_rests_and_transitions(self):
-        for pid, (name, warm, _, moves) in W.PLANS.items():
+        for pid in W.PLANS:
+            warm, chosen, _ = W.fit(pid)
             total = W.plan_seconds(pid)
-            parts = warm + sum(W.MOVES[m].seconds() for m in moves) + W.TRANSITION_S * (len(moves) - 1)
+            parts = warm + sum(W.MOVES[m].seconds(n) for m, n in chosen) + W.TRANSITION_S * (len(chosen) - 1)
             self.assertEqual(total, parts)
-            self.assertIn(f"about {round(total / 60)} min total", W.render(pid))
+            self.assertIn(f"{W._mmss(total)} total", W.render(pid))
         bridge = W.MOVES["glute_bridge"]                     # 2 x 12 reps @4 s, 45 s rest
         self.assertEqual(bridge.seconds(), 2 * 12 * 4 + 45)
         side = W.MOVES["side_plank"]                         # 2 x 20 s per side, 10 s switch, 30 s rest
         self.assertEqual(side.seconds(), 2 * (40 + 10) + 30)
+
+    def test_every_plan_fits_its_budget(self):
+        for pid in W.PLANS:
+            for mins in (None, 5, 8, 10, 15, 20, 45):
+                limit = 60 * (mins or W.BUDGET_MIN[pid])
+                self.assertLessEqual(W.plan_seconds(pid, mins), limit, (pid, mins))
+                self.assertIn(f"within {limit // 60} min", W.render(pid, minutes=mins))
+                self.assertIn(W._mmss(W.plan_seconds(pid, mins)) + " total", W.render(pid, minutes=mins))
+        # the old 15-minute plan was 16:00; a 15-minute request must now fit
+        self.assertLessEqual(W.plan_seconds("strength15", 15), 900)
+        # never padded beyond the full plan
+        self.assertEqual(W.plan_seconds("strength15", 60), 959)
+
+    def test_short_version_fits_budget(self):
+        import re as _re
+        for pid in W.PLANS:
+            for mins in (None, 5, 8):
+                m = _re.search(r"(\d+):(\d\d) total", W.shorter(pid, mins))
+                self.assertLessEqual(int(m[1]) * 60 + int(m[2]), 60 * (mins or W.BUDGET_MIN[pid]))
+
+    def test_minutes_parsing(self):
+        self.assertEqual(W.minutes_in("give me a 15-minute workout"), 15)
+        self.assertEqual(W.minutes_in("I only have 8 mins"), 8)
+        self.assertEqual(W.minutes_in("2 min"), W.MIN_BUDGET_MIN)
+        self.assertIsNone(W.minutes_in("a quick workout"))
 
     def test_profile_cues_need_confirmation_and_match_plan(self):
         self.assertEqual(W.profile_notes({}, "strength15"), [])
@@ -234,6 +260,10 @@ class TestConversation(Base):
         self.msg("/workout")
         self.msg("is there a shorter version?")
         self.assertIn("short version", self.last())
+        self.msg("I only have 8 minutes")
+        self.assertIn("within 8 min", self.last())
+        self.msg("15 minute workout")
+        self.assertIn("within 15 min", self.last())
 
     def test_profile_confirm_and_remove(self):
         with open(os.environ["SPINE_HEALTH_PROFILE"], "w") as fh:

@@ -196,7 +196,7 @@ class Assistant:
             return self.emit(chat, A.health_summary(now=self.now()))
         if cmd == "workout":
             plan = "mobility10" if "mob" in arg else "walkprep8" if "walk" in arg else "strength15"
-            return self.emit(chat, A.workout(plan, self.confirmed_profile()))
+            return self.emit(chat, A.workout(plan, self.confirmed_profile(), A.workouts.minutes_in(arg)))
         if cmd == "mobility":
             return self.emit(chat, A.mobility(self.confirmed_profile()))
         if cmd == "property":
@@ -261,7 +261,8 @@ class Assistant:
         if intent == "mobility":
             return self.emit(chat, A.mobility(self.confirmed_profile()))
         if intent == "workout":
-            return self.emit(chat, A.workout("strength15", self.confirmed_profile()))
+            return self.emit(chat, A.workout("strength15", self.confirmed_profile(),
+                                             A.workouts.minutes_in(text)))
         if intent == "sleep":
             return self.emit(chat, A.sleep_answer(now=self.now()))
         if intent == "improve":
@@ -498,8 +499,12 @@ class Assistant:
                     "physio check before continuing. Mild muscle effort and soreness a day later are "
                     "normal. For today, the mobility plan is a gentler option: /mobility",
                     domain="health"), reply_to=msg_id)
+            mins = A.workouts.minutes_in(text)
+            if mins:
+                return self.emit(chat, A.workout(plan, self.confirmed_profile(), mins), reply_to=msg_id)
             if has(r"short|quick|less time|no time|busy"):
-                return self.emit(chat, Reply(A.workouts.shorter(plan), domain="health"), reply_to=msg_id)
+                return self.emit(chat, Reply(A.workouts.shorter(plan, ref.get("minutes")), domain="health"),
+                                 reply_to=msg_id)
             if has(r"easier|too hard|hard|tough|beginner"):
                 return self.emit(chat, Reply(
                     "Easier: use each move's “Easier” option and do 1 set instead of 2. Keep the "
@@ -654,7 +659,9 @@ class Assistant:
                 " ".join(old), s.conn, online=s.pref("research_online"), now=self.now(),
                 opener=self.research_opener, kws=old, asp=arg, context=" ".join(old)))
         if action == "w_short":
-            return self.emit(chat, Reply(A.workouts.shorter(arg or "strength15"), domain="health"))
+            return self.emit(chat, Reply(A.workouts.shorter(arg or "strength15",
+                                                            (card["ref"] or {}).get("minutes")),
+                                         domain="health"))
         if action == "profile":
             return self.show_profile(chat)
         if action in ("pf_confirm", "pf_remove"):
