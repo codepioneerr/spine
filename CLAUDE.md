@@ -295,8 +295,8 @@ that stops silo #11.
 | **1** | Model router (tiers, not model names) · cost accounting · `bin/status` | ✅ complete |
 | **2a** | Item store (`items`), `ctx.db`, `bin/items`, heartbeat migrated | ✅ complete |
 | **2b** | Read-only bridge to acris/polymarket/eventbot · `bin/compare-migration` · heartbeat off the store | ✅ burn-in Sept 30 – Oct 6: acris 7/7 clean, eventbot 6/7 (one miss, day 2), **polymarket unverified** (window empty every run) |
-| **3** | **Proptech collector** (ACRIS/PLUTO depth) | ✅ Oct 6 — `core.proptech`, `collectors/proptech`; awaiting review |
-| **4** | Assistant v1 — daily brief → Telegram | |
+| **3** | **Proptech collector** (ACRIS/PLUTO depth) | ✅ Oct 6 — reviewed and merged (ce0e038); 3b (b176e00): condo unit lots, ACRIS staleness alert; AVM v0 merged gated (804c0bd) |
+| **4** | Assistant v1 — daily brief → Telegram | 🟡 `collectors/brief` scheduled 09:40 UTC; model step RAM-gated in-run (083fd78) |
 | **5** | Email + calendar collectors, read-only | |
 | **6** | Trading + reselling migration · docs · publish | |
 
@@ -312,8 +312,26 @@ is what `acris` puts in the brief. History lives in `acris_docs`,
 lookup against NYC's public dataset for the ~94% of parcels the darkweb-jobs
 slice misses: a deliberate, narrow exception to "darkweb-jobs is the fetch
 layer", reasoned in `core/proptech.py`. It emits repeat-sale signals
-(single-parcel, whole-interest deeds only). Known gap: condo unit lots
-(lot 1001+) are absent from PLUTO and stay unenriched.
+(single-parcel, whole-interest deeds only).
+
+**Phase 3b (Oct 6).** Condo unit lots (1001–6999) are mapped through the
+Digital Tax Map datasets into `condo_lots` (unit → base → billing lot);
+PLUTO files a condo under its *billing* lot (75xx), and `parcels_for`
+answers a unit BBL with that building's facts. `acris` also emits a
+`feed-stale:<date>` alert when the newest recorded date is >7 days old
+(`SPINE_ACRIS_STALE_DAYS`); the city's feed sat at 2026-08-31 on Oct 6.
+
+**AVM v0 (Oct 6).** `core.avm`, comps-based with a leave-one-out backtest.
+Nothing surfaces until its level backtests under 25% MdAPE
+(`surfaceable()`); keep it that way until the error drops.
+
+**The brief and RAM (Oct 6).** `brief` is a light job. Its model step
+(qwen3.5:4b, ~3.6 GB resident) checks 3500 MB + headroom itself, retries
+3× 60 s apart, and is skipped with a note if RAM never frees — the brief is
+always sent. Do not lower that threshold: 3.6 GB into ~1 GB free is an OOM.
+
+`bin/proptech-report` shows job outcomes, PLUTO coverage, condo mapping and
+open alerts on one screen.
 
 **Phase 2b is not complete when the tests pass.** Every test in
 `tests/test_phase2b.py` runs against synthetic databases built from dumped
