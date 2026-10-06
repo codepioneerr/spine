@@ -31,7 +31,7 @@ fact reaches a logging endpoint.
 
 from __future__ import annotations
 
-from core import bridge
+from core import bridge, proptech
 
 META = {
     "id": "acris",
@@ -179,7 +179,7 @@ def body_of(row) -> str:
     if not row["bbl"]:
         bits.append("no legal record yet")
     elif row["address"] is None:
-        bits.append("not in the PLUTO slice (MN/BK, 6+ units)")
+        bits.append("not in the PLUTO slice, not yet looked up")
     return " · ".join(bits)
 
 
@@ -189,8 +189,34 @@ def select(conn, since: str, min_amount: int, limit: int = MAX_ROWS):
         SQL, (since, min_amount, *INTERESTING_TYPES, limit)).fetchall()
 
 
-def build_items(rows) -> list[dict]:
-    """Rows to items. Pure — no I/O, so the tests can hit it directly."""
+# Building fields a Phase 3 parcel can supply when darkweb-jobs' PLUTO slice
+# does not cover the lot.
+PARCEL_FILL = ("address", "zipcode", "bldgclass", "zonedist1", "unitsres",
+               "unitstotal", "yearbuilt", "bldgarea", "assesstot", "ownername")
+
+
+def enrich(row, parcels: dict | None):
+    """The row, with building fields filled from Spine's parcels table where
+    the darkweb-jobs slice left them null. The slice wins when it has a value:
+    it is refreshed weekly, and Spine's copy may be older."""
+    if not parcels:
+        return row
+    p = parcels.get(proptech.normalize_bbl(row["bbl"]) or "")
+    if not p:
+        return row
+    out = dict(row)
+    for f in PARCEL_FILL:
+        if out.get(f) is None and p.get(f) is not None:
+            out[f] = p[f]
+    return out
+
+
+def build_items(rows, parcels: dict | None = None) -> list[dict]:
+    """Rows to items. Pure — no I/O, so the tests can hit it directly.
+
+    `parcels` (bbl -> facts, from core.proptech) fills buildings the slice
+    does not cover. Optional, so bin/compare-migration, which compares keys
+    only, is unaffected."""
     seen: set[str] = set()
     items: list[dict] = []
     for row in rows:
@@ -198,6 +224,7 @@ def build_items(rows) -> list[dict]:
         if doc in seen:
             continue
         seen.add(doc)
+        row = enrich(row, parcels)
         items.append({
             "kind": "deal",
             "key": doc,
@@ -241,7 +268,21 @@ def run(ctx):
     finally:
         conn.close()
 
-    items = build_items(rows)
+    # Phase 3: parcels collectors/proptech has filled beyond the slice. A
+    # missing or locked spine.db must not cost the deal feed, so a failure
+    # here degrades to the slice-only behaviour rather than raising.
+    parcels = {}
+    want = [r["bbl"] for r in rows if r["bbl"] and r["address"] is None]
+    if want:
+        try:
+            pconn = proptech.connect()
+            try:
+                parcels = proptech.parcels_for(pconn, want)
+            finally:
+                pconn.close()
+        except Exception as exc:                           # noqa: BLE001
+            ctx.log(f"acris: parcel enrichment skipped: {exc}")
+    items = build_items(rows, parcels)
     ctx.log(f"acris: {len(rows)} joined row(s) -> {len(items)} document(s)")
 
     if ctx.dry_run:

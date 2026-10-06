@@ -294,14 +294,26 @@ that stops silo #11.
 | **0** | Job contract · registry generates crontab · `run.sh` + flock · windows + RAM guard | ✅ complete |
 | **1** | Model router (tiers, not model names) · cost accounting · `bin/status` | ✅ complete |
 | **2a** | Item store (`items`), `ctx.db`, `bin/items`, heartbeat migrated | ✅ complete |
-| **2b** | Read-only bridge to acris/polymarket/eventbot · `bin/compare-migration` · heartbeat off the store | ✅ built; **burn-in required before Phase 3** |
-| **3** | **Proptech collector** (ACRIS/PLUTO depth) | *order changed by Nick, Sept 3* |
+| **2b** | Read-only bridge to acris/polymarket/eventbot · `bin/compare-migration` · heartbeat off the store | ✅ burn-in Sept 30 – Oct 6: acris 7/7 clean, eventbot 6/7 (one miss, day 2), **polymarket unverified** (window empty every run) |
+| **3** | **Proptech collector** (ACRIS/PLUTO depth) | ✅ Oct 6 — `core.proptech`, `collectors/proptech`; awaiting review |
 | **4** | Assistant v1 — daily brief → Telegram | |
 | **5** | Email + calendar collectors, read-only | |
 | **6** | Trading + reselling migration · docs · publish | |
 
 **Stop and ask for code review when a phase is complete.** Do not roll into
 the next phase unprompted.
+
+**Phase 3, as built (Oct 6 2026).** Two thresholds, set from
+`--preview`: `SPINE_PROPTECH_STORE_MIN` ($1M, ~85 docs/day) is what Spine
+keeps in its own history tables; `SPINE_PROPTECH_MIN_AMOUNT` ($5M, ~12/day)
+is what `acris` puts in the brief. History lives in `acris_docs`,
+`acris_doc_parcels` and `parcels` in spine.db — reference data beside
+`items`, not in it (7a). `collectors/proptech` fills PLUTO facts by BBL
+lookup against NYC's public dataset for the ~94% of parcels the darkweb-jobs
+slice misses: a deliberate, narrow exception to "darkweb-jobs is the fetch
+layer", reasoned in `core/proptech.py`. It emits repeat-sale signals
+(single-parcel, whole-interest deeds only). Known gap: condo unit lots
+(lot 1001+) are absent from PLUTO and stay unenriched.
 
 **Phase 2b is not complete when the tests pass.** Every test in
 `tests/test_phase2b.py` runs against synthetic databases built from dumped

@@ -114,8 +114,8 @@ function for clean secrets handling rather than a claim that it's finished.
 | 0 | job contract · crontab registry · runner · RAM guard | ✅ |
 | 1 | model router · cost accounting · `bin/status` | ✅ |
 | 2a | the item store | ✅ |
-| 2b | migrate the legacy collectors | next |
-| 3 | proptech collector | |
+| 2b | read-only bridge to the legacy collectors | ✅ |
+| 3 | proptech: ACRIS history, PLUTO depth, repeat sales | ✅ |
 | 4 | assistant v1 — daily brief | |
 | 5 | email + calendar, read-only | |
 | 6 | trading + reselling · docs | |
