@@ -14,7 +14,10 @@ error message this module raises.
 from __future__ import annotations
 
 import html
+import http.client
 import json
+import sys
+import time
 import uuid
 import urllib.error
 import urllib.request
@@ -74,28 +77,67 @@ class Bot:
         self._token = token
         self.timeout = timeout
         self._open = opener or urllib.request.urlopen
+        self._conns = {}
 
     def _scrub(self, s: str) -> str:
         return s.replace(self._token, "<token>")
 
+    def _conn(self, lane, timeout):
+        """One persistent HTTPS connection per lane ('poll' / 'send').
+        A fresh TLS handshake per call cost ~0.8 s each; reuse removes it."""
+        c = self._conns.get(lane)
+        if c is None:
+            c = http.client.HTTPSConnection("api.telegram.org", timeout=timeout)
+            self._conns[lane] = c
+        c.timeout = timeout
+        if c.sock is not None:
+            c.sock.settimeout(timeout)
+        return c
+
     def call(self, method: str, payload: dict | None = None, timeout=None, files=None):
-        url = f"{API}/bot{self._token}/{method}"
         if files:
             body, ctype = _multipart(payload or {}, files)
         else:
             body, ctype = json.dumps(payload or {}).encode(), "application/json"
+        timeout = timeout or self.timeout
+        t0 = time.time()
+        if self._open is not urllib.request.urlopen:          # tests inject an opener
+            data = self._call_urllib(method, body, ctype, timeout)
+        else:
+            lane = "poll" if method == "getUpdates" else "send"
+            data = None
+            for attempt in (1, 2):                             # one reconnect on a stale socket
+                c = self._conn(lane, timeout)
+                try:
+                    c.request("POST", f"/bot{self._token}/{method}", body=body,
+                              headers={"Content-Type": ctype})
+                    r = c.getresponse()
+                    raw = r.read()
+                    data = json.loads(raw.decode())
+                    break
+                except (http.client.HTTPException, OSError, ValueError) as exc:
+                    c.close()
+                    self._conns.pop(lane, None)
+                    if attempt == 2:
+                        raise TgError(self._scrub(f"{method}: {type(exc).__name__}: {exc}")) from None
+        if method != "getUpdates":
+            print(f"tg_call method={method} ms={int((time.time() - t0) * 1000)}", file=sys.stdout,
+                  flush=True)
+        if not data.get("ok"):
+            raise TgError(self._scrub(f"{method}: {data.get('description')}"))
+        return data["result"]
+
+    def _call_urllib(self, method, body, ctype, timeout):
+        url = f"{API}/bot{self._token}/{method}"
         req = urllib.request.Request(url, data=body, headers={"Content-Type": ctype})
         try:
-            with self._open(req, timeout=timeout or self.timeout) as r:
-                data = json.loads(r.read().decode())
+            with self._open(req, timeout=timeout) as r:
+                return json.loads(r.read().decode())
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:300]
             raise TgError(self._scrub(f"{method}: HTTP {exc.code} {detail}")) from None
         except Exception as exc:
             raise TgError(self._scrub(f"{method}: {type(exc).__name__}: {exc}")) from None
-        if not data.get("ok"):
-            raise TgError(self._scrub(f"{method}: {data.get('description')}"))
-        return data["result"]
 
     def send(self, chat_id, text, buttons=None, reply_to=None, silent=False):
         """Sends text (split if long). Buttons attach to the LAST part.
